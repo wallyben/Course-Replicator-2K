@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Course Replicator 2K{% endblock %}</title>
+<link rel="stylesheet" href="/static/style.css">
+{% block head %}{% endblock %}
+</head>
+<body>
+
+<header class="site-header">
+  <div class="header-inner">
+    <h1>🏌 {% block course_name %}Course Replicator 2K{% endblock %}</h1>
+    <div class="header-meta">
+      {% block header_meta %}{% endblock %}
+    </div>
+    <div style="margin-left:auto;display:flex;gap:0.5em;">
+      <a href="/" style="color:var(--text-dim);text-decoration:none;font-size:0.85em;">Overview</a>
+      <a href="/guide" style="color:var(--text-dim);text-decoration:none;font-size:0.85em;">Full Guide</a>
+      <a href="/qa" style="color:var(--text-dim);text-decoration:none;font-size:0.85em;">QA Report</a>
+    </div>
+  </div>
+</header>
+
+<main class="main-content">
+{% block content %}{% endblock %}
+</main>
+
+{% block scripts %}{% endblock %}
+</body>
+</html>

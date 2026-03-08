@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+
+{% block title %}{{ course_name }} — Course Overview{% endblock %}
+
+{% block course_name %}{{ course_name }}{% endblock %}
+
+{% block header_meta %}
+<span>{{ holes|length }} holes</span>
+<span>Par {{ total_par }}</span>
+<span>{{ "{:,}".format(total_yards) }}y</span>
+<span>{{ course_type|title }}</span>
+{% if qa_status %}
+<span class="qa-badge qa-{{ qa_status|lower }}">QA: {{ qa_status }}</span>
+{% endif %}
+{% endblock %}
+
+{% block content %}
+
+<section class="overview-section">
+  <h2 style="color:var(--blue);margin-bottom:1em;">Build Overview</h2>
+
+  <div class="overview-grid">
+
+    <!-- Fidelity card -->
+    <div class="overview-card">
+      <h3>Fidelity Estimate</h3>
+      {% if fidelity %}
+      <p style="font-size:2.5em;font-weight:bold;
+          color:{% if fidelity.overall_score >= 70 %}var(--green)
+                {% elif fidelity.overall_score >= 50 %}var(--orange)
+                {% else %}var(--red){% endif %}">
+        {{ fidelity.overall_score }}%
+      </p>
+      <p>{{ fidelity.label }}</p>
+      {% else %}
+      <p style="color:var(--text-dim)">Not computed</p>
+      {% endif %}
+    </div>
+
+    <!-- Terrain card -->
+    <div class="overview-card">
+      <h3>Terrain Reference</h3>
+      {% if has_heightmap %}
+      <img src="/images/heightmap.png" alt="Heightmap" style="width:100%;border-radius:4px;margin-bottom:0.5em">
+      {% endif %}
+      {% if has_slope_map %}
+      <a href="/images/slope_map.png" target="_blank" style="color:var(--blue);font-size:0.85em">
+        View slope map ↗
+      </a>
+      {% endif %}
+    </div>
+
+    <!-- Feature map card -->
+    <div class="overview-card">
+      <h3>Feature Map</h3>
+      {% if has_feature_map %}
+      <img src="/images/feature_map.png" alt="Feature map" style="width:100%;border-radius:4px">
+      {% else %}
+      <p style="color:var(--text-dim)">Not generated</p>
+      {% endif %}
+    </div>
+
+    <!-- Quick start card -->
+    <div class="overview-card">
+      <h3>Quick Start</h3>
+      <ol style="font-size:0.85em;padding-left:1.2em;line-height:2">
+        <li>Open PGA 2K Course Designer on Xbox</li>
+        <li>Create a new course ({{ course_type|title }})</li>
+        <li>Open heightmap.png as reference on this screen</li>
+        <li>Click Hole 1 below to begin</li>
+      </ol>
+      <a href="/hole/{{ holes[0].number if holes else 1 }}"
+         style="display:inline-block;margin-top:0.75em;padding:0.5em 1.2em;
+                background:var(--green);color:#000;text-decoration:none;
+                border-radius:6px;font-weight:bold">
+        Start Building →
+      </a>
+    </div>
+
+  </div>
+
+  <!-- QA Warnings -->
+  {% if qa_status == 'WARN' or qa_status == 'FAIL' %}
+  <div style="background:var(--bg2);border:1px solid var(--orange);border-radius:8px;
+              padding:1em;margin-bottom:1.5em">
+    <h3 style="color:var(--orange);margin-bottom:0.5em">⚠ QA Warnings</h3>
+    <p style="font-size:0.9em;color:var(--text-dim)">
+      See <a href="/qa" style="color:var(--orange)">QA report</a> for details.
+      Some features may require manual verification.
+    </p>
+  </div>
+  {% endif %}
+
+</section>
+
+<!-- Hole grid -->
+<section>
+  <h2 style="color:var(--blue);margin-bottom:0.75em;">18 Holes</h2>
+  <div class="holes-grid">
+    {% for hole in holes %}
+    <a href="/hole/{{ hole.number }}" class="hole-card">
+      <div class="hole-card-num">{{ hole.number }}</div>
+      <div class="hole-card-meta">
+        Par {{ hole.par or '?' }} &nbsp;·&nbsp; {{ hole.yards or '?' }}y
+      </div>
+      <div style="font-size:0.75em;color:var(--text-dim);margin-top:0.2em">
+        {{ hole.n_steps }} build steps
+      </div>
+      {% if hole.has_image %}
+      <img src="/images/{{ hole.image }}" alt="Hole {{ hole.number }}"
+           loading="lazy" onerror="this.style.display='none'">
+      {% endif %}
+    </a>
+    {% endfor %}
+  </div>
+</section>
+
+{% endblock %}

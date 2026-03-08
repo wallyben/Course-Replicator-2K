@@ -1,0 +1,338 @@
+"""
+terrain.py — DTM processing: heightmap generation, slope analysis, terrain classification.
+
+Inputs:  dtm.tif (from lidar.py)
+Outputs:
+  - heightmap.png        16-bit greyscale PNG, normalised 0–65535
+  - slope_map.png        Colour-shaded slope classification map
+  - terrain_regions.tif  Raster: 1=flat, 2=gentle, 3=moderate, 4=steep
+  - terrain_stats.json   {z_min, z_max, z_range, slope_mean, resolution_m, ...}
+"""
+
+import json
+import logging
+import os
+import sys
+from pathlib import Path
+from typing import Tuple
+
+import numpy as np
+import rasterio
+from rasterio.enums import Resampling
+from rasterio.mask import mask as rio_mask
+from rasterio.warp import calculate_default_transform, reproject
+from rasterio.crs import CRS
+from shapely.geometry import shape, mapping
+from shapely.ops import transform as shp_transform
+from pyproj import Transformer
+from PIL import Image
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+import config
+
+log = logging.getLogger(__name__)
+
+
+# ─── Main entry point ─────────────────────────────────────────────────────────
+
+def process_terrain(dtm_path: Path, boundary_data: dict, output_dir: Path) -> dict:
+    """
+    Full terrain processing pipeline.
+
+    Args:
+        dtm_path:      Path to raw DTM GeoTIFF (any CRS)
+        boundary_data: Output from boundary.resolve_boundary()
+        output_dir:    Directory for output files
+
+    Returns:
+        terrain_stats dict with keys used downstream
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Step 1: Reproject DTM to Irish Transverse Mercator at target resolution
+    dtm_itm_path = output_dir / "dtm_itm.tif"
+    log.info("Reprojecting DTM to ITM...")
+    _reproject_to_itm(dtm_path, dtm_itm_path)
+
+    # Step 2: Clip to course boundary (with buffer)
+    dtm_clipped_path = output_dir / "dtm_clipped.tif"
+    log.info("Clipping DTM to course boundary...")
+    boundary_poly = shape(boundary_data["boundary_wgs84"])
+    _clip_to_boundary(dtm_itm_path, dtm_clipped_path, boundary_poly, boundary_data)
+
+    # Step 3: Read processed DTM
+    with rasterio.open(dtm_clipped_path) as src:
+        dtm_arr = src.read(1).astype(np.float32)
+        nodata  = src.nodata
+        res_m   = src.res[0]
+        transform = src.transform
+        crs       = src.crs
+
+    # Mask nodata
+    if nodata is not None:
+        dtm_arr[dtm_arr == nodata] = np.nan
+
+    # Step 4: Compute statistics
+    valid = dtm_arr[~np.isnan(dtm_arr)]
+    z_min  = float(np.nanmin(dtm_arr))
+    z_max  = float(np.nanmax(dtm_arr))
+    z_range = z_max - z_min
+    z_mean = float(np.nanmean(dtm_arr))
+
+    log.info(f"Elevation range: {z_min:.1f}m – {z_max:.1f}m ({z_range:.1f}m total relief)")
+
+    if z_range < config.MIN_ELEVATION_RELIEF_M:
+        log.warning(
+            f"Very low terrain relief ({z_range:.2f}m). "
+            "Course may be nearly flat or DTM quality is poor."
+        )
+
+    # Step 5: Generate heightmap PNG
+    heightmap_path = output_dir / "heightmap.png"
+    log.info("Generating heightmap PNG...")
+    _generate_heightmap(dtm_arr, heightmap_path)
+
+    # Step 6: Compute slope
+    log.info("Computing slope map...")
+    slope_arr = _compute_slope(dtm_arr, res_m)
+
+    # Step 7: Terrain region classification
+    regions_arr = _classify_terrain(slope_arr)
+    regions_path = output_dir / "terrain_regions.tif"
+    _write_raster(regions_arr.astype(np.uint8), regions_path, dtm_clipped_path)
+
+    # Step 8: Slope map image
+    slope_map_path = output_dir / "slope_map.png"
+    log.info("Rendering slope map...")
+    _render_slope_map(slope_arr, regions_arr, slope_map_path)
+
+    # Step 9: Compute 2K height mapping
+    tk2_mapping = _compute_2k_height_mapping(z_min, z_max)
+
+    # Assemble stats
+    stats = {
+        "z_min_m":              round(z_min, 2),
+        "z_max_m":              round(z_max, 2),
+        "z_range_m":            round(z_range, 2),
+        "z_mean_m":             round(z_mean, 2),
+        "resolution_m":         round(float(res_m), 2),
+        "dtm_shape":            list(dtm_arr.shape),
+        "slope_mean_deg":       round(float(np.nanmean(slope_arr)), 2),
+        "slope_max_deg":        round(float(np.nanmax(slope_arr)), 2),
+        "flat_pct":             round(float(np.sum(regions_arr == 1) / regions_arr.size * 100), 1),
+        "gentle_pct":           round(float(np.sum(regions_arr == 2) / regions_arr.size * 100), 1),
+        "moderate_pct":         round(float(np.sum(regions_arr == 3) / regions_arr.size * 100), 1),
+        "steep_pct":            round(float(np.sum(regions_arr == 4) / regions_arr.size * 100), 1),
+        "tk2_height_at_z_min":  tk2_mapping["min"],
+        "tk2_height_at_z_max":  tk2_mapping["max"],
+        "tk2_height_per_metre": tk2_mapping["per_metre"],
+        "heightmap_path":       str(heightmap_path),
+        "slope_map_path":       str(slope_map_path),
+        "dtm_clipped_path":     str(dtm_clipped_path),
+    }
+
+    stats_path = output_dir / "terrain_stats.json"
+    stats_path.write_text(json.dumps(stats, indent=2))
+    log.info(f"Terrain stats written to {stats_path}")
+
+    return stats
+
+
+# ─── Reprojection ─────────────────────────────────────────────────────────────
+
+def _reproject_to_itm(src_path: Path, dst_path: Path) -> None:
+    """Reproject raster to ITM (EPSG:2157) at config.DTM_RESOLUTION_M."""
+    dst_crs = CRS.from_epsg(2157)
+
+    with rasterio.open(src_path) as src:
+        transform, width, height = calculate_default_transform(
+            src.crs, dst_crs, src.width, src.height, *src.bounds
+        )
+        # Snap to target resolution
+        res = config.DTM_RESOLUTION_M
+        transform = rasterio.transform.from_origin(
+            transform.c, transform.f,
+            res, res,
+        )
+        width  = max(1, int(abs(src.bounds.right  - src.bounds.left)  / res) + 1)
+        height = max(1, int(abs(src.bounds.top    - src.bounds.bottom) / res) + 1)
+
+        kwargs = src.meta.copy()
+        kwargs.update({
+            "crs":       dst_crs,
+            "transform": transform,
+            "width":     width,
+            "height":    height,
+            "dtype":     "float32",
+            "nodata":    -9999.0,
+        })
+
+        with rasterio.open(dst_path, "w", **kwargs) as dst:
+            for i in range(1, src.count + 1):
+                reproject(
+                    source=rasterio.band(src, i),
+                    destination=rasterio.band(dst, i),
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    dst_transform=transform,
+                    dst_crs=dst_crs,
+                    resampling=Resampling.bilinear,
+                )
+
+
+def _clip_to_boundary(
+    dtm_path: Path, dst_path: Path,
+    boundary_poly, boundary_data: dict
+) -> None:
+    """Clip DTM to the course boundary polygon projected to ITM."""
+    from pyproj import Transformer
+    from shapely.ops import transform as shp_transform
+
+    t = Transformer.from_crs(config.CRS_WGS84, config.CRS_ITM, always_xy=True)
+    boundary_itm = shp_transform(t.transform, boundary_poly)
+
+    # Use buffered bounding box as clip region (preserve context around course)
+    buf = config.BOUNDARY_BUFFER_M
+    clipped_region = boundary_itm.buffer(buf)
+
+    with rasterio.open(dtm_path) as src:
+        out_image, out_transform = rio_mask(src, [mapping(clipped_region)], crop=True)
+        out_meta = src.meta.copy()
+        out_meta.update({
+            "driver":    "GTiff",
+            "height":    out_image.shape[1],
+            "width":     out_image.shape[2],
+            "transform": out_transform,
+        })
+        with rasterio.open(dst_path, "w", **out_meta) as dst:
+            dst.write(out_image)
+
+
+# ─── Heightmap ────────────────────────────────────────────────────────────────
+
+def _generate_heightmap(dtm_arr: np.ndarray, out_path: Path) -> None:
+    """
+    Export a 16-bit greyscale heightmap PNG normalised to 0–65535.
+    NaN cells become 0 (sea level baseline).
+    """
+    z_min = float(np.nanmin(dtm_arr))
+    z_max = float(np.nanmax(dtm_arr))
+    z_range = z_max - z_min
+
+    if z_range < 0.01:
+        # Flat course — produce uniform mid-grey
+        normalised = np.full(dtm_arr.shape, 32768, dtype=np.uint16)
+    else:
+        normalised = ((dtm_arr - z_min) / z_range * 65535)
+        normalised = np.nan_to_num(normalised, nan=0.0)
+        normalised = np.clip(normalised, 0, 65535).astype(np.uint16)
+
+    # Resize to config.HEIGHTMAP_SIZE_PX × config.HEIGHTMAP_SIZE_PX
+    img = Image.fromarray(normalised, mode="I;16")
+    size = config.HEIGHTMAP_SIZE_PX
+    img = img.resize((size, size), Image.LANCZOS)
+    img.save(str(out_path))
+    log.info(f"Heightmap saved: {out_path} ({size}×{size}px, 16-bit)")
+
+
+# ─── Slope ────────────────────────────────────────────────────────────────────
+
+def _compute_slope(dtm_arr: np.ndarray, resolution_m: float) -> np.ndarray:
+    """
+    Compute slope in degrees from a DTM array.
+    Uses central difference (numpy gradient).
+    """
+    # Fill NaN with mean for gradient computation
+    filled = np.where(np.isnan(dtm_arr), np.nanmean(dtm_arr), dtm_arr)
+    dy, dx = np.gradient(filled, resolution_m, resolution_m)
+    slope = np.degrees(np.arctan(np.sqrt(dx**2 + dy**2)))
+    slope[np.isnan(dtm_arr)] = np.nan
+    return slope.astype(np.float32)
+
+
+def _classify_terrain(slope_arr: np.ndarray) -> np.ndarray:
+    """
+    Classify terrain by slope into 4 regions:
+      1 = flat     (< SLOPE_FLAT_MAX)
+      2 = gentle   (SLOPE_FLAT_MAX – SLOPE_GENTLE_MAX)
+      3 = moderate (SLOPE_GENTLE_MAX – SLOPE_MODERATE_MAX)
+      4 = steep    (>= SLOPE_MODERATE_MAX)
+    """
+    regions = np.zeros(slope_arr.shape, dtype=np.uint8)
+    regions[slope_arr <  config.SLOPE_FLAT_MAX]     = 1
+    regions[(slope_arr >= config.SLOPE_FLAT_MAX)    & (slope_arr < config.SLOPE_GENTLE_MAX)]   = 2
+    regions[(slope_arr >= config.SLOPE_GENTLE_MAX)  & (slope_arr < config.SLOPE_MODERATE_MAX)] = 3
+    regions[slope_arr >= config.SLOPE_MODERATE_MAX] = 4
+    regions[np.isnan(slope_arr)] = 0
+    return regions
+
+
+# ─── Slope map rendering ─────────────────────────────────────────────────────
+
+def _render_slope_map(slope_arr: np.ndarray, regions_arr: np.ndarray, out_path: Path) -> None:
+    """Render a colour-coded slope classification map and save as PNG."""
+    # Colour map: 0=outside, 1=flat(green), 2=gentle(yellow), 3=moderate(orange), 4=steep(red)
+    cmap = mcolors.ListedColormap(["#cccccc", "#4caf50", "#ffeb3b", "#ff9800", "#f44336"])
+    bounds = [-0.5, 0.5, 1.5, 2.5, 3.5, 4.5]
+    norm   = mcolors.BoundaryNorm(bounds, cmap.N)
+
+    fig, ax = plt.subplots(figsize=(10, 10), dpi=config.FEATURE_MAP_DPI)
+    ax.imshow(regions_arr, cmap=cmap, norm=norm, origin="upper")
+    ax.set_axis_off()
+
+    cbar = fig.colorbar(
+        plt.cm.ScalarMappable(norm=norm, cmap=cmap),
+        ax=ax, fraction=0.03, pad=0.02,
+        ticks=[0, 1, 2, 3, 4],
+    )
+    cbar.ax.set_yticklabels(["Outside", "Flat (<2°)", "Gentle (2–8°)", "Moderate (8–20°)", "Steep (>20°)"])
+
+    plt.title("Terrain Slope Classification", pad=12)
+    plt.tight_layout()
+    plt.savefig(str(out_path), bbox_inches="tight", dpi=config.FEATURE_MAP_DPI)
+    plt.close()
+    log.info(f"Slope map saved: {out_path}")
+
+
+# ─── 2K height mapping ────────────────────────────────────────────────────────
+
+def _compute_2k_height_mapping(z_min: float, z_max: float) -> dict:
+    """
+    Compute the mapping from real-world elevation to 2K height slider (0–100).
+    Returns per_metre value for use in build instructions.
+    """
+    z_range = max(z_max - z_min, 0.01)
+    per_metre = (config.TK2_HEIGHT_MAX - config.TK2_HEIGHT_MIN) / z_range
+    return {
+        "min":       config.TK2_HEIGHT_MIN,
+        "max":       config.TK2_HEIGHT_MAX,
+        "per_metre": round(per_metre, 3),
+        "z_min_m":   round(z_min, 2),
+        "z_max_m":   round(z_max, 2),
+    }
+
+
+def z_to_2k(z_m: float, terrain_stats: dict) -> float:
+    """Convert a real-world elevation (metres) to 2K height slider value (0–100)."""
+    z_min = terrain_stats["z_min_m"]
+    z_range = terrain_stats["z_range_m"]
+    if z_range < 0.01:
+        return 50.0
+    val = (z_m - z_min) / z_range * config.TK2_HEIGHT_MAX
+    return round(max(0.0, min(100.0, val)), 1)
+
+
+# ─── Utility: write classified raster ────────────────────────────────────────
+
+def _write_raster(arr: np.ndarray, out_path: Path, template_path: Path) -> None:
+    """Write a uint8 array as GeoTIFF using metadata from template_path."""
+    with rasterio.open(template_path) as src:
+        meta = src.meta.copy()
+    meta.update({"count": 1, "dtype": "uint8", "nodata": 0})
+    with rasterio.open(out_path, "w", **meta) as dst:
+        dst.write(arr[np.newaxis, :, :])

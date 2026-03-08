@@ -1,0 +1,289 @@
+{% extends "base.html" %}
+
+{% block title %}Hole {{ hole.hole_number }} — {{ course_name }}{% endblock %}
+
+{% block course_name %}{{ course_name }}{% endblock %}
+
+{% block header_meta %}
+<span>Hole {{ hole.hole_number }}</span>
+<span>Par {{ hole.par or '?' }}</span>
+<span>{{ (hole.length_yards|int) if hole.length_yards else '?' }}y</span>
+<span>S.I. {{ hole.handicap or '?' }}</span>
+{% endblock %}
+
+{% block head %}
+<style>
+.hole-body {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0;
+}
+@media (min-width: 1000px) {
+  .hole-body {
+    grid-template-columns: 400px 1fr;
+  }
+  .hole-sidebar {
+    position: sticky;
+    top: 100px;
+    align-self: start;
+    max-height: calc(100vh - 120px);
+    overflow-y: auto;
+  }
+}
+.progress-bar-outer {
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  margin: 0.5em 0 1em;
+}
+.progress-bar-inner {
+  height: 100%;
+  background: var(--green);
+  border-radius: 2px;
+  transition: width 0.3s;
+}
+.step-collapsed .step-body { display: none; }
+</style>
+{% endblock %}
+
+{% block content %}
+
+<!-- Hole navigation -->
+<div style="display:flex;align-items:center;gap:1em;margin-bottom:1em;flex-wrap:wrap;">
+  {% if prev_hole %}
+  <a href="/hole/{{ prev_hole }}" class="nav-btn">◄ Hole {{ prev_hole }}</a>
+  {% endif %}
+
+  <div style="display:flex;gap:4px;flex-wrap:wrap;">
+    {% for n in all_holes %}
+    <a href="/hole/{{ n }}"
+       style="padding:2px 6px;border-radius:4px;font-size:0.75em;text-decoration:none;
+              border:1px solid var(--border);
+              {% if n == hole.hole_number %}background:var(--green);color:#000;
+              {% else %}color:var(--text-dim);{% endif %}">
+      {{ n }}
+    </a>
+    {% endfor %}
+  </div>
+
+  {% if next_hole %}
+  <a href="/hole/{{ next_hole }}" class="nav-btn" style="margin-left:auto">Hole {{ next_hole }} ►</a>
+  {% endif %}
+</div>
+
+<!-- Progress bar -->
+<div class="progress-bar-outer">
+  <div class="progress-bar-inner" id="progressBar" style="width:0%"></div>
+</div>
+<div style="font-size:0.8em;color:var(--text-dim);margin-bottom:1em" id="progressText">
+  0 / {{ hole.steps|length }} steps complete
+</div>
+
+<!-- Main two-column layout -->
+<div class="hole-body">
+
+  <!-- Left: Maps and reference data -->
+  <div class="hole-sidebar" style="padding-right:1em;border-right:1px solid var(--border);">
+
+    {% if has_overview %}
+    <div style="margin-bottom:1em">
+      <p style="font-size:0.75em;color:var(--text-dim);margin-bottom:0.3em">OVERHEAD VIEW</p>
+      <img src="/images/holes/hole_{{ '%02d'|format(hole.hole_number) }}_overview.png"
+           alt="Hole {{ hole.hole_number }} overview"
+           style="width:100%;border-radius:8px;border:1px solid var(--border)">
+    </div>
+    {% endif %}
+
+    {% if has_heightmap %}
+    <div style="margin-bottom:1em">
+      <p style="font-size:0.75em;color:var(--text-dim);margin-bottom:0.3em">HEIGHTMAP REFERENCE</p>
+      <img src="/images/heightmap.png" alt="Heightmap"
+           style="width:100%;border-radius:8px;border:1px solid var(--border);opacity:0.85">
+    </div>
+    {% endif %}
+
+    <!-- Hole key metrics -->
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:1em;margin-bottom:1em;">
+      <h3 style="font-size:0.85em;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.75em">
+        Key Metrics
+      </h3>
+      <table style="width:100%;font-size:0.9em;border-collapse:collapse">
+        <tr>
+          <td style="color:var(--text-dim);padding:3px 0">Championship</td>
+          <td style="text-align:right;font-weight:bold">
+            {{ (hole.length_yards|int) if hole.length_yards else '—' }}y
+          </td>
+        </tr>
+        <tr>
+          <td style="color:var(--text-dim);padding:3px 0">Par</td>
+          <td style="text-align:right;font-weight:bold">{{ hole.par or '—' }}</td>
+        </tr>
+        <tr>
+          <td style="color:var(--text-dim);padding:3px 0">Stroke Index</td>
+          <td style="text-align:right;font-weight:bold">{{ hole.handicap or '—' }}</td>
+        </tr>
+        {% if hole_meta.bunkers %}
+        <tr>
+          <td style="color:var(--text-dim);padding:3px 0">Bunkers (OSM)</td>
+          <td style="text-align:right;font-weight:bold">{{ hole_meta.bunkers|length }}</td>
+        </tr>
+        {% endif %}
+        <tr>
+          <td style="color:var(--text-dim);padding:3px 0">Data source</td>
+          <td style="text-align:right;font-size:0.8em;color:var(--text-dim)">
+            {{ hole_meta.routing_source|replace('_',' ')|title if hole_meta.routing_source else '—' }}
+          </td>
+        </tr>
+      </table>
+    </div>
+
+    <!-- External reference links -->
+    <div style="font-size:0.8em;color:var(--text-dim)">
+      <p style="margin-bottom:0.3em;color:var(--text-dim);text-transform:uppercase;font-size:0.75em;letter-spacing:0.05em">
+        External Reference
+      </p>
+      <a href="https://www.openstreetmap.org/#map=17/{{ hole_meta.green_centroid[1] if hole_meta.green_centroid else 0 }}/{{ hole_meta.green_centroid[0] if hole_meta.green_centroid else 0 }}"
+         target="_blank"
+         style="display:block;color:var(--blue);margin-bottom:0.4em">
+        View on OpenStreetMap ↗
+      </a>
+      <a href="https://www.google.com/maps/@{{ hole_meta.green_centroid[1] if hole_meta.green_centroid else 0 }},{{ hole_meta.green_centroid[0] if hole_meta.green_centroid else 0 }},200m/data=!3m1!1e3"
+         target="_blank"
+         style="display:block;color:var(--blue);margin-bottom:0.4em">
+        View satellite (Google) ↗
+      </a>
+    </div>
+
+  </div>
+
+  <!-- Right: Build steps -->
+  <div style="padding-left:1em;">
+    <h2 style="color:var(--green);margin-bottom:1em">
+      Build Steps
+      <span style="font-size:0.6em;color:var(--text-dim);font-weight:normal">
+        ({{ hole.steps|length }} total)
+      </span>
+    </h2>
+
+    <div class="steps-list" id="stepsList">
+      {% for step in hole.steps %}
+      <div class="step step-{{ step.category|lower }}" data-step="{{ step.step }}"
+           id="step-{{ step.step }}">
+        <div class="step-header" onclick="toggleStep({{ step.step }})">
+          <span class="step-num">Step {{ step.step }}</span>
+          <span class="step-cat cat-{{ step.category|lower }}">{{ step.category }}</span>
+          <span class="step-title">{{ step.title }}</span>
+          <span class="conf conf-{{ (step.confidence or 'LOW')|lower }}">
+            {{ step.confidence or 'LOW' }}
+          </span>
+          <label class="checkbox-label" onclick="event.stopPropagation()">
+            <input type="checkbox" class="step-check"
+                   data-hole="{{ hole.hole_number }}" data-step="{{ step.step }}">
+            Done
+          </label>
+        </div>
+        <div class="step-body">
+          <p class="action-text">{{ step.action|replace('\n', '<br>')|safe }}</p>
+
+          {% if step.measurements %}
+          <ul class="measurements">
+            {% for k, v in step.measurements.items() %}
+            <li><b>{{ k.replace('_', ' ')|title }}:</b> {{ v }}</li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+
+          {% if step.reference %}
+          <div class="ref-link">
+            📄 Reference: <code>{{ step.reference }}</code>
+          </div>
+          {% endif %}
+
+          {% if step.manual_flag %}
+          <div class="manual-flag">⚠ {{ step.manual_flag }}</div>
+          {% endif %}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+
+    <!-- Completion summary -->
+    <div style="margin-top:1.5em;padding:1em;background:var(--bg2);border:1px solid var(--border);border-radius:8px">
+      <p style="color:var(--text-dim);font-size:0.9em;margin-bottom:0.5em">Hole complete?</p>
+      {% if next_hole %}
+      <a href="/hole/{{ next_hole }}"
+         style="display:inline-block;padding:0.6em 1.4em;background:var(--green);color:#000;
+                text-decoration:none;border-radius:6px;font-weight:bold">
+        Move to Hole {{ next_hole }} →
+      </a>
+      {% else %}
+      <p style="color:var(--green);font-weight:bold">Course complete! Run QA check.</p>
+      <a href="/qa" style="color:var(--blue)">View QA Report →</a>
+      {% endif %}
+    </div>
+
+  </div>
+
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+// ── Checkbox state persistence ────────────────────────────────────────────
+const holeNum = {{ hole.hole_number }};
+const totalSteps = {{ hole.steps|length }};
+
+function getKey(hole, step) {
+  return `h${hole}_s${step}`;
+}
+
+function updateProgress() {
+  const checks = document.querySelectorAll('.step-check');
+  const done   = Array.from(checks).filter(c => c.checked).length;
+  const pct    = totalSteps > 0 ? Math.round(done / totalSteps * 100) : 0;
+  document.getElementById('progressBar').style.width = pct + '%';
+  document.getElementById('progressText').textContent = `${done} / ${totalSteps} steps complete`;
+}
+
+document.querySelectorAll('.step-check').forEach(cb => {
+  const key = getKey(cb.dataset.hole, cb.dataset.step);
+  cb.checked = localStorage.getItem(key) === '1';
+  if (cb.checked) cb.closest('.step').classList.add('step-done');
+
+  cb.addEventListener('change', () => {
+    localStorage.setItem(key, cb.checked ? '1' : '0');
+    cb.closest('.step').classList.toggle('step-done', cb.checked);
+    updateProgress();
+  });
+});
+
+updateProgress();
+
+// ── Step collapse/expand ─────────────────────────────────────────────────
+function toggleStep(stepNum) {
+  const el = document.getElementById('step-' + stepNum);
+  if (el) el.classList.toggle('step-collapsed');
+}
+
+// Auto-scroll to first uncompleted step on load
+document.addEventListener('DOMContentLoaded', () => {
+  const firstUndone = document.querySelector('.step:not(.step-done)');
+  if (firstUndone) {
+    firstUndone.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+});
+
+// Keyboard shortcuts: n = next hole, p = previous hole
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  {% if next_hole %}
+  if (e.key === 'n' || e.key === 'ArrowRight') window.location = '/hole/{{ next_hole }}';
+  {% endif %}
+  {% if prev_hole %}
+  if (e.key === 'p' || e.key === 'ArrowLeft')  window.location = '/hole/{{ prev_hole }}';
+  {% endif %}
+  if (e.key === 'h') window.location = '/';
+});
+</script>
+{% endblock %}
