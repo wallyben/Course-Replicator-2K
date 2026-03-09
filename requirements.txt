@@ -33,6 +33,9 @@ mercantile>=1.2.1
 opencv-python>=4.8.0
 scikit-image>=0.21.0
 
+# Routing diagram AI: OCR for hole numbers
+pytesseract>=0.3.10
+
 # V2: OSM Overpass wrapper
 overpy>=0.7
 

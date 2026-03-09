@@ -187,6 +187,15 @@ Examples:
             "WARNING: this overwrites manually digitized GeoJSON files."
         ),
     )
+    parser.add_argument(
+        "--diagram",
+        metavar="IMAGE",
+        help=(
+            "Path to a routing diagram image (PNG/JPEG). "
+            "Features extracted from the diagram override satellite and OSM. "
+            "Example: --diagram assets/routing_diagrams/old_conna_layout.png"
+        ),
+    )
     args = parser.parse_args()
 
     if args.verbose:
@@ -201,6 +210,8 @@ Examples:
     log.info(f"  Course Replicator 2K")
     log.info(f"  Course : {args.course_name}")
     log.info(f"  Type   : {args.type}")
+    if args.diagram:
+        log.info(f"  Diagram: {args.diagram}")
     log.info(f"  Output : {output_dir}")
     log.info(f"{'='*60}")
 
@@ -307,6 +318,46 @@ Examples:
             log.error(f"Terrain processing failed: {e}")
             log.exception(e)
             sys.exit(1)
+
+    # ── Step 3b: Routing diagram extraction (optional) ───────────────────────
+    _diagram_result: dict = {}
+    _use_diagram_features = False
+
+    if args.diagram:
+        diagram_path = Path(args.diagram)
+        if not diagram_path.exists():
+            log.error(f"Diagram file not found: {diagram_path}")
+            log.error("Check the --diagram path and try again.")
+            sys.exit(1)
+
+        log.info(f"\n[3b] Extracting features from routing diagram: {diagram_path.name}")
+        try:
+            from pipeline.routing_diagram_ai import (
+                extract_routing_diagram,
+                fuse_diagram_features,
+            )
+            _diagram_result = extract_routing_diagram(
+                diagram_path  = diagram_path,
+                boundary_data = boundary_data,
+                output_dir    = output_dir,
+            )
+            diag_counts = {k: len(v) for k, v in _diagram_result.items()
+                           if isinstance(v, list)}
+            log.info(f"  Diagram extraction counts: {diag_counts}")
+            total_diag = sum(diag_counts.values())
+            if total_diag > 0:
+                _use_diagram_features = True
+                log.info("  Diagram features will override satellite + OSM.")
+            else:
+                log.warning(
+                    "  Routing diagram produced 0 features — "
+                    "check colour thresholds and image quality."
+                )
+        except ImportError as e:
+            log.error(f"Routing diagram module import error: {e}")
+        except Exception as e:
+            log.warning(f"  Routing diagram extraction failed (non-critical): {e}")
+            log.exception(e)
 
     # ── Step 4: Golf feature extraction ──────────────────────────────────────
     log.info("\n[4/5] Extracting golf features from OSM...")
@@ -524,11 +575,44 @@ Examples:
         except Exception as e:
             log.warning(f"  ML vision refinement failed (non-critical): {e}")
 
+    # ── Routing diagram feature fusion ───────────────────────────────────────
+    # Priority: routing_diagram > satellite/OSM > existing files
+    # Trees and rough are NOT overwritten — the diagram doesn't model them.
+    if _use_diagram_features and _diagram_result:
+        log.info("\n[3c] Fusing routing diagram features into pipeline layers...")
+        try:
+            from pipeline.routing_diagram_ai import fuse_diagram_features
+            fusion_summary = fuse_diagram_features(_diagram_result, output_dir)
+            for layer, info in fusion_summary.items():
+                action = info.get("action", "?")
+                count  = info.get("count",  0)
+                log.info(f"  [{layer}] {action} — {count} features")
+        except Exception as e:
+            log.warning(f"  Feature fusion failed (non-critical): {e}")
+
     # ── V2: Course routing reconstruction (UPGRADE 4) ─────────────────────────
     log.info("\n[V2] Reconstructing course routing...")
     routing_data = {}
+
+    # Diagram routing takes highest priority — holes.geojson was already
+    # written by fuse_diagram_features() above.
+    if _use_diagram_features and _diagram_result.get("holes"):
+        _diag_holes = _diagram_result["holes"]
+        routing_data = {
+            "hole_count": len(_diag_holes),
+            "holes":      [h.get("properties", {}) for h in _diag_holes],
+            "holes_path": str(output_dir / "holes.geojson"),
+            "routing_method": "routing_diagram",
+        }
+        log.info(
+            f"  Routing from diagram: {len(_diag_holes)} holes — "
+            f"skipping routing reconstruction."
+        )
+
     routing_path = output_dir / "holes.geojson"
-    if _is_valid_cache(routing_path) and _geojson_has_features(routing_path):
+    if routing_data:
+        pass  # already populated from diagram above
+    elif _is_valid_cache(routing_path) and _geojson_has_features(routing_path):
         log.info(f"  Using cached routing ({routing_path.name})")
         try:
             # Read actual hole properties from holes.geojson — do NOT read
@@ -754,10 +838,18 @@ Examples:
             size_kb = f.stat().st_size / 1024
             log.info(f"    {f.relative_to(output_dir)} ({size_kb:.0f}KB)")
     log.info(f"")
+    if _use_diagram_features:
+        _diag_counts = {k: len(v) for k, v in _diagram_result.items() if isinstance(v, list)}
+        _diag_total  = sum(_diag_counts.values())
+        log.info(f"  ✓ Routing diagram features used — {_diag_total} total.")
+        log.info(f"    Diagram: {args.diagram}")
+        for layer, cnt in _diag_counts.items():
+            if cnt:
+                log.info(f"    {layer}: {cnt}")
     if _use_manual_features:
         log.info(f"  ✓ Manual digitizer features were used (preserved).")
         log.info(f"    To re-detect: re-run with --force-redetect")
-    else:
+    if not _use_manual_features and not _use_diagram_features:
         log.info(f"  Tip — refine features with the manual digitizer:")
         log.info(f"    python pipeline/manual_digitizer/server.py --course {output_dir}")
         log.info(f"    Open  http://localhost:{getattr(config,'DIGITIZER_PORT',5050)}")
