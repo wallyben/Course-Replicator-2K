@@ -15,10 +15,10 @@ and guides you hole-by-hole through the in-game build via a second-screen app.
 pip install -r requirements.txt
 
 # 2. Run the pipeline for a course
-python scripts/run_pipeline.py "Lahinch Golf Club" --type links
+python scripts/run_pipeline.py "Old Conna Golf Club" --type parkland
 
 # 3. Start the companion app (on second screen / tablet beside Xbox)
-python companion/app.py --course output/lahinch-golf-club
+python companion/app.py --course output/old-conna-golf-club
 
 # 4. Open in browser on second screen
 # http://localhost:5000
@@ -50,10 +50,10 @@ python scripts/run_pipeline.py "Portmarnock Golf Club" --type parkland
 python scripts/run_pipeline.py "Waterville Golf Links" --type links
 
 # With manual scorecard (recommended for accuracy)
-python scripts/run_pipeline.py "Lahinch Golf Club" --scorecard lahinch_scorecard.json
+python scripts/run_pipeline.py "Old Conna Golf Club" --scorecard old_conna_scorecard.json
 
 # Manual bounding box if OSM lookup fails
-python scripts/run_pipeline.py "My Course" --bbox -9.35,52.95,-9.30,53.00
+python scripts/run_pipeline.py "My Course" --bbox -6.15,53.10,-6.10,53.15
 ```
 
 ### Scorecard JSON format
@@ -75,7 +75,7 @@ python scripts/fetch_osm.py "Ballybunion Golf Club"
 ### Export build pack as ZIP
 
 ```bash
-python scripts/export_buildpack.py lahinch-golf-club --out ~/Desktop/
+python scripts/export_buildpack.py old-conna-golf-club --out ~/Desktop/
 ```
 
 ---
@@ -107,7 +107,7 @@ Golf features via **OpenStreetMap Overpass API** (free, no key required).
 
 ```
 output/
-└── lahinch-golf-club/
+└── old-conna-golf-club/
     ├── boundary.json           Course boundary + OSM metadata
     ├── dtm.tif                 Raw DTM raster
     ├── dtm_clipped.tif         DTM clipped to course area
@@ -145,8 +145,8 @@ Features:
 - QA report access
 
 ```bash
-python companion/app.py --course output/lahinch-golf-club
-python companion/app.py --course output/lahinch-golf-club --port 8080
+python companion/app.py --course output/old-conna-golf-club
+python companion/app.py --course output/old-conna-golf-club --port 8080
 ```
 
 ---

@@ -3,8 +3,8 @@
 serve_companion.py — Quick launcher for the companion app.
 
 Usage:
-    python scripts/serve_companion.py lahinch-golf-club
-    python scripts/serve_companion.py output/lahinch-golf-club --port 8080
+    python scripts/serve_companion.py old-conna-golf-club
+    python scripts/serve_companion.py output/old-conna-golf-club --port 8080
 """
 
 import argparse
@@ -19,7 +19,7 @@ def main():
     parser = argparse.ArgumentParser(description="Start companion app")
     parser.add_argument(
         "course",
-        help="Course slug (e.g. lahinch-golf-club) or full path to output directory",
+        help="Course slug (e.g. old-conna-golf-club) or full path to output directory",
     )
     parser.add_argument("--port", type=int, default=config.COMPANION_PORT)
     parser.add_argument("--host", default=config.COMPANION_HOST)

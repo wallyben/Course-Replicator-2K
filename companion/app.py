@@ -1,7 +1,7 @@
 """
 companion/app.py — Local Flask companion web app for beside-Xbox use.
 
-Run: python companion/app.py --course output/lahinch-golf-club
+Run: python companion/app.py --course output/old-conna-golf-club
 Then open http://localhost:5000 on a tablet or second screen beside the Xbox.
 """
 
@@ -191,7 +191,7 @@ def main():
     parser.add_argument(
         "--course", "-c",
         required=True,
-        help="Path to the course output directory (e.g. output/lahinch-golf-club)",
+        help="Path to the course output directory (e.g. output/old-conna-golf-club)",
     )
     parser.add_argument("--host", default=config.COMPANION_HOST)
     parser.add_argument("--port", type=int, default=config.COMPANION_PORT)

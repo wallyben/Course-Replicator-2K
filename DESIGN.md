@@ -40,7 +40,7 @@ A single determined builder can use this system to:
 ## SECTION 2 — TARGET WORKFLOW
 
 ```
-INPUT: Course name (e.g. "Lahinch Golf Club")
+INPUT: Course name (e.g. "Old Conna Golf Club")
        │
        ▼
 [1] BOUNDARY RESOLUTION
@@ -592,7 +592,7 @@ Builder confirms feel against known photographs/video.
 ## SECTION 10 — MVP BUILD PLAN
 
 ### Target Course for MVP
-**Lahinch Golf Club (Old Course)** — Well-mapped in OSM, INLP LiDAR coverage exists for County Clare, iconic Irish links character, 18-hole par 72, publicly known distances.
+**Old Conna Golf Club** — Well-mapped in OSM, INLP LiDAR coverage exists for County Wicklow, mature parkland character with strong elevation change, 18-hole par 72, publicly known distances.
 
 ### Simplest Useful Toolchain
 
@@ -643,7 +643,7 @@ Course-Replicator-2K/
 
 | Days | Task |
 |------|------|
-| 1–3  | Set up repo, install dependencies, verify Overpass API works for Lahinch |
+| 1–3  | Set up repo, install dependencies, verify Overpass API works for Old Conna |
 | 4–6  | Build `boundary.py` — fetch and export course boundary polygon |
 | 7–9  | Build `features.py` — extract all OSM golf features, confidence scoring |
 | 10–13| Build `lidar.py` — INLP tile discovery + download, EU-DEM fallback |
@@ -651,7 +651,7 @@ Course-Replicator-2K/
 | 18–20| Build `translation.py` — scale conversion, step generation |
 | 21–23| Build `qa.py` — distance validation, fidelity scoring |
 | 24–26| Build companion app — Flask, per-hole pages, overlay maps |
-| 27–28| Run full pipeline on Lahinch, generate build pack |
+| 27–28| Run full pipeline on Old Conna, generate build pack |
 | 29–30| Do manual build in 2K using companion app, identify gaps, iterate |
 
 ---
@@ -727,11 +727,11 @@ The pipeline is **data-in, build-pack-out**. The companion app is **build-pack-i
 
 ### Most Likely Path to a Result That Actually Works
 
-1. **Prove the data first**: Manually download OSM data for Lahinch, check quality. Manually download a LiDAR tile, confirm coverage. If either is bad, re-scope.
+1. **Prove the data first**: Manually download OSM data for Old Conna, check quality. Manually download a LiDAR tile, confirm coverage. If either is bad, re-scope.
 2. **Build boundary.py and features.py first**: These are pure API calls and geometry — lowest risk, immediate validation.
 3. **Build terrain.py with EU-DEM fallback first**: Don't wait for INLP pipeline to work. EU-DEM at 25m is enough to validate the heightmap workflow.
 4. **Build the companion app early (day 18–20)**: Getting the output usable beside Xbox quickly reveals what data is actually needed.
-5. **Build one course in 2K before finishing the tool**: The act of building Lahinch with a half-finished tool will reveal what information is missing and what's irrelevant.
+5. **Build one course in 2K before finishing the tool**: The act of building Old Conna with a half-finished tool will reveal what information is missing and what's irrelevant.
 6. **Iterate on the pipeline from real build experience**: The builder knows what they needed and didn't have. That drives the backfill roadmap.
 
 ### Honest Final Assessment

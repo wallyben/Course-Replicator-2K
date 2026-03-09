@@ -3,13 +3,13 @@
 run_pipeline.py — Main CLI entry point for Course Replicator 2K.
 
 Usage:
-    python scripts/run_pipeline.py "Lahinch Golf Club"
+    python scripts/run_pipeline.py "Old Conna Golf Club"
     python scripts/run_pipeline.py "Ballybunion Golf Club" --type links
     python scripts/run_pipeline.py "Portmarnock Golf Club" --scorecard scorecard.json
-    python scripts/run_pipeline.py --bbox -9.35,52.95,-9.30,53.00 "Custom Course"
+    python scripts/run_pipeline.py --bbox -6.15,53.10,-6.10,53.15 "Custom Course"
 
 After running, start the companion app:
-    python companion/app.py --course output/lahinch-golf-club
+    python companion/app.py --course output/old-conna-golf-club
 """
 
 import argparse
@@ -47,9 +47,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python scripts/run_pipeline.py "Lahinch Golf Club"
+  python scripts/run_pipeline.py "Old Conna Golf Club"
   python scripts/run_pipeline.py "Ballybunion Golf Club" --type links
-  python scripts/run_pipeline.py --bbox -9.35,52.95,-9.30,53.00 "My Course"
+  python scripts/run_pipeline.py --bbox -6.15,53.10,-6.10,53.15 "My Course"
   python scripts/run_pipeline.py "Royal County Down" --scorecard scorecard.json
         """,
     )

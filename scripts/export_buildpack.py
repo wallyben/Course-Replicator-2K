@@ -5,8 +5,8 @@ export_buildpack.py — Export a build pack as a portable ZIP archive.
 Packages all output files into a single ZIP for easy transfer/backup.
 
 Usage:
-    python scripts/export_buildpack.py lahinch-golf-club
-    python scripts/export_buildpack.py output/lahinch-golf-club --out ~/Desktop/
+    python scripts/export_buildpack.py old-conna-golf-club
+    python scripts/export_buildpack.py output/old-conna-golf-club --out ~/Desktop/
 """
 
 import argparse

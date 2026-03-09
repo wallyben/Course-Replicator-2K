@@ -5,7 +5,7 @@ fetch_osm.py — Standalone OSM data fetcher and inspector.
 Useful for checking OSM coverage before running the full pipeline.
 
 Usage:
-    python scripts/fetch_osm.py "Lahinch Golf Club"
+    python scripts/fetch_osm.py "Old Conna Golf Club"
     python scripts/fetch_osm.py "Ballybunion Golf Club" --save
 """
 

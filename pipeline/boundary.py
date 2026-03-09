@@ -158,7 +158,7 @@ def resolve_boundary(course_name: str) -> dict:
     if not elements:
         raise ValueError(
             f"No OSM golf course found for: {course_name!r}. "
-            "Try the exact club name (e.g. 'Lahinch Golf Club') or check OSM coverage."
+            "Try the exact club name (e.g. 'Old Conna Golf Club') or check OSM coverage."
         )
 
     # Find the best candidate: prefer relations, then ways
