@@ -108,6 +108,14 @@ ENABLE_TEE_DETECTION = True
 # When False the pipeline behaves exactly as without this flag.
 ENABLE_ML_VISION = False
 
+# ─── Segment Anything Model (SAM) — optional heavy dependency ─────────────────
+# Set True to enable SAM-based satellite segmentation (pipeline/sam_segment.py).
+# Requires: pip install torch torchvision segment-anything
+# Checkpoint: wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth
+ENABLE_SAM     = False
+SAM_CHECKPOINT = "sam_vit_b_01ec64.pth"   # path to ViT-B checkpoint file
+SAM_MODEL_TYPE = "vit_b"                   # vit_h | vit_l | vit_b
+
 # ─── Cache validation ──────────────────────────────────────────────────────────
 # Minimum file size (bytes) for a cache file to be considered valid.
 # Files smaller than this are treated as empty/corrupt and regenerated.

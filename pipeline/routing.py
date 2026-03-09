@@ -117,6 +117,12 @@ def reconstruct_routing(
     _write_holes_geojson(holes, holes_path)
     log.info(f"Routing: {len(holes)} holes written to {holes_path.name}")
 
+    # Write routing_debug.geojson (tee→green LineStrings per hole)
+    try:
+        _write_routing_debug_geojson(holes, output_dir)
+    except Exception as e:
+        log.debug(f"routing_debug.geojson export failed: {e}")
+
     # Write holes_metadata.json — authoritative routing summary.
     # NOTE: features.py writes osm_holes_metadata.json (list format) so there
     # is no filename collision.  This dict format is what QA and translation read.
@@ -958,6 +964,14 @@ def _multi_segment_routing(
             hole_num += 1
 
         log.info(f"Multi-segment routing holes: {len(holes)}")
+
+        # Write fairway adjacency graph as GeoJSON for debug_viz ──────────────
+        if osm_dir and edges and t_to_wgs:
+            try:
+                _write_fairway_graph_geojson(fw_itm, edges, t_to_wgs, osm_dir)
+            except Exception as ge:
+                log.debug(f"fairway_graph.geojson write failed: {ge}")
+
         return holes
 
     except Exception as e:
@@ -1066,6 +1080,95 @@ def _haversine(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
     dlam = math.radians(lon2 - lon1)
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+# ─── Debug GeoJSON exports ────────────────────────────────────────────────────
+
+def _write_fairway_graph_geojson(
+    fw_itm: list,
+    edges: List[Tuple[int, int]],
+    t_to_wgs,
+    output_dir: Path,
+) -> None:
+    """
+    Write fairway_graph.geojson — each edge in the fairway adjacency graph
+    as a LineString connecting the centroids of the two adjacent fairways.
+
+    Args:
+        fw_itm:     List of Shapely fairway polygons in ITM coordinates
+        edges:      List of (i, j) index pairs from the adjacency graph
+        t_to_wgs:   PyProj Transformer ITM→WGS84
+        output_dir: Directory to write fairway_graph.geojson
+    """
+    features = []
+    for i, j in edges:
+        try:
+            ci = fw_itm[i].centroid
+            cj = fw_itm[j].centroid
+            lon1, lat1 = t_to_wgs.transform(ci.x, ci.y)
+            lon2, lat2 = t_to_wgs.transform(cj.x, cj.y)
+            features.append({
+                "type": "Feature",
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[lon1, lat1], [lon2, lat2]],
+                },
+                "properties": {
+                    "from_fairway": i,
+                    "to_fairway":   j,
+                    "type":         "fairway_adjacency",
+                },
+            })
+        except Exception:
+            continue
+
+    out_path = output_dir / "fairway_graph.geojson"
+    out_path.write_text(
+        json.dumps({"type": "FeatureCollection", "features": features}, indent=2),
+        encoding="utf-8",
+    )
+    log.info(f"fairway_graph.geojson: {len(features)} edges → {out_path.name}")
+
+
+def _write_routing_debug_geojson(holes: List[dict], output_dir: Path) -> None:
+    """
+    Write routing_debug.geojson — per-hole tee-to-green LineStrings.
+
+    This file contains one LineString feature per hole, from tee_position
+    to green_position, with hole metadata as properties.  Used by the
+    companion app and debug_viz to visualise routing.
+    """
+    features = []
+    for h in holes:
+        tee   = h.get("tee_position")   or {}
+        green = h.get("green_position") or {}
+        t_lon, t_lat = tee.get("lon"), tee.get("lat")
+        g_lon, g_lat = green.get("lon"), green.get("lat")
+        if None in (t_lon, t_lat, g_lon, g_lat):
+            continue
+        features.append({
+            "type": "Feature",
+            "geometry": {
+                "type": "LineString",
+                "coordinates": [[t_lon, t_lat], [g_lon, g_lat]],
+            },
+            "properties": {
+                "hole_number":    h.get("hole_number"),
+                "par":            h.get("par"),
+                "distance_yards": h.get("distance_yards"),
+                "routing_source": h.get("routing_source"),
+                "type":           "hole_routing",
+            },
+        })
+
+    out_path = output_dir / "routing_debug.geojson"
+    out_path.write_text(
+        json.dumps({"type": "FeatureCollection", "features": features}, indent=2),
+        encoding="utf-8",
+    )
+    log.info(
+        f"routing_debug.geojson: {len(features)} holes → {out_path.name}"
+    )
 
 
 # ─── Output ───────────────────────────────────────────────────────────────────

@@ -350,10 +350,30 @@ Examples:
     log.info("\n[V2] Running satellite vision feature detection...")
     try:
         from pipeline.vision_extract import detect_features, merge_vision_with_osm
-        vision_summary = detect_features(boundary_data["bbox_wgs84"], output_dir, zoom=16)
+        vision_summary = detect_features(
+            boundary_data["bbox_wgs84"],
+            output_dir,
+            zoom=16,
+            boundary_data=boundary_data,   # UPGRADE 1: course boundary mask
+        )
         if vision_summary.get("detections"):
             merge_stats = merge_vision_with_osm(vision_summary, output_dir)
             log.info(f"  Vision detections merged: {merge_stats}")
+
+        # UPGRADE 9: Feature count validation
+        try:
+            from pipeline.feature_validation import (
+                validate_feature_counts,
+                write_validation_report,
+            )
+            _feat_counts = {
+                k: v.get("count", 0)
+                for k, v in vision_summary.get("detections", {}).items()
+            }
+            _val_results = validate_feature_counts(_feat_counts)
+            write_validation_report(_feat_counts, _val_results, output_dir)
+        except Exception as ve:
+            log.debug(f"Feature validation failed (non-critical): {ve}")
     except Exception as e:
         log.warning(f"  Vision extraction failed (non-critical): {e}")
 
@@ -536,6 +556,29 @@ Examples:
                 log.info(f"    {key}: {Path(path).name}")
     except Exception as e:
         log.warning(f"  Enhanced build pack failed (non-critical): {e}")
+
+    # ── UPGRADE 10: Debug visualizations ─────────────────────────────────────
+    log.info("\n[V3] Generating debug visualizations...")
+    try:
+        from pipeline.debug_viz import (
+            generate_vision_debug_overlay,
+            generate_fairway_graph_debug,
+            generate_routing_debug,
+        )
+        generate_vision_debug_overlay(
+            output_dir / "satellite_mosaic.jpg",
+            output_dir,
+            boundary_data,
+        )
+        generate_fairway_graph_debug(output_dir, boundary_data)
+        generate_routing_debug(
+            routing_data,
+            boundary_data,
+            output_dir / "satellite_mosaic.jpg",
+            output_dir,
+        )
+    except Exception as dve:
+        log.debug(f"Debug visualizations failed (non-critical): {dve}")
 
     # ── QA ───────────────────────────────────────────────────────────────────
     log.info("\nRunning QA checks...")

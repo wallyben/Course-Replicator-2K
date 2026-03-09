@@ -138,14 +138,22 @@ def detect_features(
     bbox_wgs84: list,
     output_dir: Path,
     zoom: int = 17,
+    boundary_data: Optional[dict] = None,
 ) -> dict:
     """
     Download satellite tiles and detect golf features using computer vision.
 
+    UPGRADE 1: When boundary_data is provided, a course boundary raster mask
+    is applied to every detection pass, eliminating features outside the
+    golf course polygon.
+
     Args:
-        bbox_wgs84:  [min_lon, min_lat, max_lon, max_lat]
-        output_dir:  Directory for output GeoJSON and debug images
-        zoom:        Tile zoom level (17 ≈ 1.2m/px, 16 ≈ 2.4m/px)
+        bbox_wgs84:     [min_lon, min_lat, max_lon, max_lat]
+        output_dir:     Directory for output GeoJSON and debug images
+        zoom:           Tile zoom level (17 ≈ 1.2m/px, 16 ≈ 2.4m/px)
+        boundary_data:  Optional boundary dict from boundary.resolve_boundary()
+                        When provided, all detections are clipped to the
+                        course polygon.
 
     Returns:
         Detection summary dict.
@@ -173,6 +181,24 @@ def detect_features(
     except Exception:
         pass
 
+    # UPGRADE 1: Build course boundary raster mask ────────────────────────────
+    # All detections will be filtered against this mask before saving so that
+    # no feature can exist outside the golf course polygon.
+    course_mask    = None
+    course_polygon = None
+    if boundary_data:
+        try:
+            from pipeline.course_mask import (
+                load_course_polygon,
+                build_raster_mask,
+            )
+            course_polygon = load_course_polygon(boundary_data)
+            course_mask    = build_raster_mask(
+                course_polygon, transform_params, img_arr.shape
+            )
+        except Exception as e:
+            log.warning(f"Course mask setup failed (continuing without mask): {e}")
+
     # Step 2: Run all detectors
     detections = {}
     detection_fns = [
@@ -189,14 +215,39 @@ def detect_features(
     for feat_type, fn in detection_fns:
         try:
             contours, mask = fn(img_arr)
+
+            # UPGRADE 1 (pixel level): filter contours to course boundary
+            if course_mask is not None:
+                try:
+                    from pipeline.course_mask import apply_mask_to_contours
+                    before = len(contours)
+                    contours = apply_mask_to_contours(contours, course_mask)
+                    if len(contours) < before:
+                        log.debug(
+                            f"Vision [{feat_type}]: boundary mask removed "
+                            f"{before - len(contours)} out-of-bounds contours"
+                        )
+                except Exception as me:
+                    log.debug(f"Mask application failed for {feat_type}: {me}")
+
             all_masks[feat_type] = mask
             out_path = output_dir / f"vision_{feat_type}s.geojson"
-            _save_detections_geojson(contours, transform_params, feat_type, out_path)
+            _save_detections_geojson(
+                contours, transform_params, feat_type, out_path,
+                course_polygon=course_polygon,
+            )
+            # Count from saved file (reflects GeoJSON-level clip)
+            try:
+                saved = json.loads(out_path.read_text(encoding="utf-8"))
+                saved_count = len(saved.get("features", []))
+            except Exception:
+                saved_count = len(contours)
+
             detections[feat_type] = {
-                "count": len(contours),
+                "count": saved_count,
                 "path":  str(out_path),
             }
-            log.info(f"Vision [{feat_type}]: {len(contours)} regions")
+            log.info(f"Vision [{feat_type}]: {saved_count} regions")
         except Exception as e:
             log.warning(f"Vision [{feat_type}] detection failed: {e}")
 
@@ -501,7 +552,11 @@ def _morph_clean(mask: np.ndarray, open_k: int = 5, close_k: int = 7) -> np.ndar
 def _detect_fairways(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
     """
     Detect fairway regions: bright green, elongated, uniform texture.
-    Geometric filter: must be large enough and elongated (not circular).
+
+    UPGRADE 8 — Fairway continuity:
+      After standard detection, apply a larger morphological close (15px, 3x)
+      to merge nearby fragmented segments.  Dogleg fairways that produce two
+      disconnected polygons are re-joined into one contiguous shape.
     """
     cv2 = _get_cv2()
     t = THRESHOLDS["fairway"]
@@ -512,13 +567,16 @@ def _detect_fairways(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
     mask[texture > t["texture_max"]] = 0
     mask = _morph_clean(mask, open_k=7, close_k=9)
 
+    # Extra large closing pass to merge fragmented dogleg segments
+    k_continuity = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_continuity, iterations=3)
+
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     valid = []
     for c in contours:
         area = cv2.contourArea(c)
         if area < MIN_FAIRWAY_AREA_PX:
             continue
-        # Fairways are elongated — reject near-circular blobs
         x, y, w, h = cv2.boundingRect(c)
         aspect = max(w, h) / max(min(w, h), 1)
         if aspect < MIN_FAIRWAY_ASPECT:
@@ -562,13 +620,18 @@ def _detect_greens(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
 def _detect_bunkers(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
     """
     Detect bunkers: light sand-coloured bright irregular patches.
-    Geometric filters: MIN/MAX_BUNKER_AREA_PX, MAX_BUNKER_ASPECT.
-    Aspect ratio cap removes thin paths and road markings mis-classified as sand.
+
+    UPGRADE 6 — Improved sand HSV signature:
+      H: 14–45  (pale yellow → beige → tan sand tones)
+      S: 10–120 (low saturation — dry sand is almost white)
+      V: 155–255 (high brightness — sand reflects strongly)
+
+    Rejects: thin lines (roads, paths), rooftop edges (aspect ratio cap).
     """
     cv2 = _get_cv2()
-    t = THRESHOLDS["bunker"]
 
-    mask = _hsv_mask(img_rgb, t["h"], t["s"], t["v"])
+    # Improved sand HSV (broader S range, narrower H to avoid roads)
+    mask = _hsv_mask(img_rgb, (14, 45), (10, 120), (155, 255))
     mask = _morph_clean(mask, open_k=3, close_k=5)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -577,7 +640,6 @@ def _detect_bunkers(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
         area = cv2.contourArea(c)
         if not (MIN_BUNKER_AREA_PX <= area <= MAX_BUNKER_AREA_PX):
             continue
-        # Reject very thin elongated shapes (paths, kerbs, etc.)
         x, y, w, h = cv2.boundingRect(c)
         aspect = max(w, h) / max(min(w, h), 1)
         if aspect > MAX_BUNKER_ASPECT:
@@ -588,27 +650,62 @@ def _detect_bunkers(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
 
 def _detect_water(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
     """
-    Detect water hazards: dark blue/grey regions.
-    Combines blue-hue mask with a dark-value mask for shadowed water.
+    Detect water hazards.
+
+    UPGRADE 7 — Multi-signal water detection to eliminate over-detection:
+
+    Combines four independent signals; a pixel is marked as water only
+    when AT LEAST 2 of the 4 signals agree:
+      1. NDWI approx  (Green-Red)/(Green+Red) > 0.05
+      2. Blue dominance  B > R×1.1  and  B > G×0.9  and  B > 40
+      3. HSV blue-hue mask  (standard blue/cyan threshold)
+      4. Dark-value mask  (V < threshold, excluding green hues)
+
+    Requiring ≥2 signals dramatically reduces false positives from:
+      - Road shadows (dark but not blue)
+      - Rooftop reflections (sometimes blue-ish)
+      - Dark tree patches (dark green, signal 3+4 but not 1+2)
+
+    Minimum water body: 200 px (connected component filter removes
+    isolated noise specks that pass the combined threshold).
     """
     cv2 = _get_cv2()
-    t = THRESHOLDS["water"]
+    t   = THRESHOLDS["water"]
 
-    # Primary: blue-hue water
-    mask_blue = _hsv_mask(img_rgb, t["h"], t["s"], t["v"])
+    r = img_rgb[:, :, 0].astype(np.float32)
+    g = img_rgb[:, :, 1].astype(np.float32)
+    b = img_rgb[:, :, 2].astype(np.float32)
 
-    # Secondary: very dark regions (V < dark_v_max) that aren't tree-green
-    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
-    dark_v = (hsv[:, :, 2] < t["dark_v_max"]).astype(np.uint8) * 255
-    # Exclude dark-green (trees) from the dark mask
-    is_green_hue = ((hsv[:, :, 0] >= 30) & (hsv[:, :, 0] <= 90)).astype(np.uint8)
-    dark_v[is_green_hue == 1] = 0
+    # Signal 1: NDWI approximation
+    ndwi         = (g - r) / (g + r + 1e-6)
+    sig_ndwi     = (ndwi > 0.05).astype(np.uint8)
 
-    mask = cv2.bitwise_or(mask_blue, dark_v)
-    mask = _morph_clean(mask, open_k=5, close_k=7)
+    # Signal 2: Blue channel dominance
+    sig_blue_dom = (
+        (b > r * 1.1) & (b > g * 0.9) & (b > 40)
+    ).astype(np.uint8)
+
+    # Signal 3: HSV blue/cyan hue
+    mask_hsv = _hsv_mask(img_rgb, t["h"], t["s"], t["v"])
+    sig_hsv  = (mask_hsv > 0).astype(np.uint8)
+
+    # Signal 4: Dark regions (V < threshold), exclude dark green (trees)
+    hsv      = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+    dark_v   = (hsv[:, :, 2] < t["dark_v_max"]).astype(np.uint8)
+    is_green = (hsv[:, :, 0] >= 30) & (hsv[:, :, 0] <= 90)
+    dark_v[is_green] = 0
+    sig_dark = dark_v
+
+    # Require ≥2 signals to agree
+    signal_sum = sig_ndwi + sig_blue_dom + sig_hsv + sig_dark
+    mask = (signal_sum >= 2).astype(np.uint8) * 255
+
+    mask = _morph_clean(mask, open_k=7, close_k=11)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    valid = [c for c in contours if cv2.contourArea(c) >= t["min_area_px"]]
+    # Minimum water body: 200 px (eliminates isolated noise)
+    MIN_WATER_PX = 200
+    valid = [c for c in contours if cv2.contourArea(c) >= MIN_WATER_PX]
     return valid, mask
 
 
@@ -659,10 +756,15 @@ def _save_detections_geojson(
     transform_params: Optional[tuple],
     feature_type: str,
     out_path: Path,
+    course_polygon=None,
 ) -> None:
     """
-    Convert pixel contours → WGS84 GeoJSON polygons, apply real-world m² area
-    filters from config, and save.
+    Convert pixel contours → WGS84 GeoJSON polygons, apply real-world m²
+    area filters from config, optionally clip to course boundary, and save.
+
+    UPGRADE 1 (GeoJSON level): when course_polygon is provided, every
+    feature is clipped to the boundary polygon as a final clean-up step
+    after pixel-level masking.
 
     Real-world filter thresholds (config.py):
       bunker:  MIN_BUNKER_AREA_M2 – MAX_BUNKER_AREA_M2
@@ -749,6 +851,14 @@ def _save_detections_geojson(
 
     if total_in != total_out:
         log.info(f"Vision filter applied — {total_in} → {total_out} {feature_type}s retained")
+
+    # UPGRADE 1 (GeoJSON level): final boundary clip
+    if course_polygon is not None and features:
+        try:
+            from pipeline.course_mask import clip_geojson_to_boundary
+            features = clip_geojson_to_boundary(features, course_polygon)
+        except Exception as e:
+            log.debug(f"GeoJSON boundary clip failed for {feature_type}: {e}")
 
     _write_geojson_features(features, out_path)
 
