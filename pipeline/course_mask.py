@@ -210,6 +210,68 @@ def apply_mask_to_contours(
         return contours
 
 
+def generate_course_mask_debug(
+    course_mask: np.ndarray,
+    satellite_mosaic_path: Path,
+    output_dir: Path,
+) -> Optional[Path]:
+    """
+    Generate course_mask_debug.png — satellite mosaic with course boundary
+    mask overlaid as a semi-transparent green fill.
+
+    Writes to output_dir/course_mask_debug.png.
+    Returns Path on success, None on failure.
+    """
+    if course_mask is None:
+        return None
+
+    try:
+        import cv2
+        from PIL import Image
+
+        mosaic_path = Path(satellite_mosaic_path)
+        if not mosaic_path.exists():
+            return None
+
+        img = np.array(Image.open(str(mosaic_path)).convert("RGB"), dtype=np.uint8)
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+        # Resize mask if image dimensions differ (tiles may vary)
+        h_img, w_img = img_bgr.shape[:2]
+        h_msk, w_msk = course_mask.shape[:2]
+        if (h_msk, w_msk) != (h_img, w_img):
+            mask_resized = cv2.resize(course_mask, (w_img, h_img), interpolation=cv2.INTER_NEAREST)
+        else:
+            mask_resized = course_mask
+
+        # Semi-transparent green overlay inside mask
+        overlay = img_bgr.copy()
+        overlay[mask_resized > 0] = (
+            overlay[mask_resized > 0] * 0.6 +
+            np.array([0, 120, 0], dtype=np.float32) * 0.4
+        ).astype(np.uint8)
+
+        # Hard boundary contour (white, 2px)
+        contours, _ = cv2.findContours(mask_resized, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(overlay, contours, -1, (255, 255, 255), 2)
+
+        # Label
+        cv2.putText(overlay, "COURSE MASK",
+                    (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        inside_pct = 100.0 * float(np.mean(mask_resized > 0))
+        cv2.putText(overlay, f"{inside_pct:.1f}% of image in boundary",
+                    (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 255, 200), 1)
+
+        out_path = Path(output_dir) / "course_mask_debug.png"
+        cv2.imwrite(str(out_path), overlay)
+        log.info(f"Debug: course_mask_debug.png written ({inside_pct:.1f}% coverage)")
+        return out_path
+
+    except Exception as e:
+        log.debug(f"course_mask_debug generation failed: {e}")
+        return None
+
+
 def clip_geojson_to_boundary(
     features: list,
     course_polygon,

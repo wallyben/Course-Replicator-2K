@@ -123,9 +123,9 @@ MAX_BUNKER_AREA_PX  = 600   # ignore oversized patches/paths (was 1500)
 MAX_BUNKER_ASPECT   = 4.0   # bounding-box long/short ratio — bunkers aren't thin lines
 
 # Greens: small, compact, circular putting surfaces
-MIN_GREEN_AREA_PX   = 80    # minimum size (was 60)
-MAX_GREEN_AREA_PX   = 400   # maximum size (was 700) — greens are small
-MIN_GREEN_CIRC      = 0.50  # circularity threshold (was 0.38) — stricter roundness
+MIN_GREEN_AREA_PX   = 60    # minimum size
+MAX_GREEN_AREA_PX   = 600   # maximum size (relaxed from 400 — some greens appear larger at zoom 16)
+MIN_GREEN_CIRC      = 0.38  # circularity threshold (relaxed from 0.50 — not all greens are round)
 
 # Fairways: large, elongated corridors
 MIN_FAIRWAY_AREA_PX = 500   # must be a substantial patch (was 400)
@@ -211,21 +211,25 @@ def detect_features(
     ]
 
     all_masks = {}  # for debug overlay
+    class_filter_stats = {}  # per-stage counts for class_filter_debug.json
 
     for feat_type, fn in detection_fns:
         try:
             contours, mask = fn(img_arr)
+            raw_count = len(contours)
 
             # UPGRADE 1 (pixel level): filter contours to course boundary
+            after_boundary = raw_count
             if course_mask is not None:
                 try:
                     from pipeline.course_mask import apply_mask_to_contours
                     before = len(contours)
                     contours = apply_mask_to_contours(contours, course_mask)
-                    if len(contours) < before:
+                    after_boundary = len(contours)
+                    if after_boundary < before:
                         log.debug(
                             f"Vision [{feat_type}]: boundary mask removed "
-                            f"{before - len(contours)} out-of-bounds contours"
+                            f"{before - after_boundary} out-of-bounds contours"
                         )
                 except Exception as me:
                     log.debug(f"Mask application failed for {feat_type}: {me}")
@@ -247,9 +251,26 @@ def detect_features(
                 "count": saved_count,
                 "path":  str(out_path),
             }
-            log.info(f"Vision [{feat_type}]: {saved_count} regions")
+            class_filter_stats[feat_type] = {
+                "raw_contours":        raw_count,
+                "after_boundary_mask": after_boundary,
+                "after_area_clip":     saved_count,
+            }
+            log.info(
+                f"Vision [{feat_type}]: {raw_count} raw → "
+                f"{after_boundary} in-bounds → {saved_count} after m² filter"
+            )
         except Exception as e:
             log.warning(f"Vision [{feat_type}] detection failed: {e}")
+
+    # Write per-stage count debug artifact
+    try:
+        (output_dir / "class_filter_debug.json").write_text(
+            json.dumps({"pass": 1, "feature_counts": class_filter_stats}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
     # Step 3: Save debug overlay with all detections coloured
     try:
@@ -264,6 +285,70 @@ def detect_features(
     }
     (output_dir / "vision_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
+
+
+def refilter_water_strict(output_dir: Path) -> int:
+    """
+    Post-hoc strict water filter.
+
+    Called by run_pipeline when water count > 25 after the main detection
+    pass.  Re-reads vision_waters.geojson, applies stricter real-world m²
+    area and compactness filters, then overwrites the file in-place.
+
+    Thresholds:
+      - Minimum area: 2000 m² (≈ 50×40m pond — smaller = drainage noise)
+      - Compactness ≥ 0.06 (rejects thin linear shadows)
+
+    Returns new water feature count (or 0 on error).
+    """
+    from shapely.geometry import shape
+    from shapely.ops import transform as shp_transform
+    from pyproj import Transformer
+
+    path = Path(output_dir) / "vision_waters.geojson"
+    if not path.exists():
+        return 0
+
+    try:
+        data     = json.loads(path.read_text(encoding="utf-8"))
+        features = data.get("features", [])
+        if not features:
+            return 0
+
+        t_to_itm = Transformer.from_crs("EPSG:4326", "EPSG:2157", always_xy=True)
+        MIN_WATER_M2_STRICT  = 2000   # m²: genuine golf water bodies are large
+        MIN_WATER_COMPACT    = 0.06   # very thin = road shadow, not pond
+
+        filtered = []
+        for f in features:
+            geom_dict = f.get("geometry")
+            if not geom_dict:
+                continue
+            try:
+                poly     = shape(geom_dict)
+                poly_itm = shp_transform(t_to_itm.transform, poly)
+                area_m2  = poly_itm.area
+                if area_m2 < MIN_WATER_M2_STRICT:
+                    continue
+                perimeter = poly_itm.length
+                if perimeter > 0:
+                    compactness = 4 * np.pi * area_m2 / (perimeter ** 2)
+                    if compactness < MIN_WATER_COMPACT:
+                        continue
+                filtered.append(f)
+            except Exception:
+                continue
+
+        _write_geojson_features(filtered, path)
+        log.info(
+            f"Water strict refilter: {len(features)} → {len(filtered)} "
+            f"(≥2000m², compactness ≥{MIN_WATER_COMPACT})"
+        )
+        return len(filtered)
+
+    except Exception as e:
+        log.warning(f"refilter_water_strict failed: {e}")
+        return 0
 
 
 def merge_vision_with_osm(
@@ -652,22 +737,24 @@ def _detect_water(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
     """
     Detect water hazards.
 
-    UPGRADE 7 — Multi-signal water detection to eliminate over-detection:
+    COUNCIL REDESIGN — Stricter multi-signal water detection.
 
     Combines four independent signals; a pixel is marked as water only
-    when AT LEAST 2 of the 4 signals agree:
+    when AT LEAST 3 of the 4 signals agree (was 2 — caused 173 false
+    positives on Old Conna due to road shadows and dark tree patches).
+
+    Signals:
       1. NDWI approx  (Green-Red)/(Green+Red) > 0.05
-      2. Blue dominance  B > R×1.1  and  B > G×0.9  and  B > 40
-      3. HSV blue-hue mask  (standard blue/cyan threshold)
-      4. Dark-value mask  (V < threshold, excluding green hues)
+      2. Blue dominance  B > R×1.15  and  B > G×0.85  and  B > 60
+      3. HSV blue-hue mask  (tighter: H 95-135, dark V)
+      4. Dark-value mask  (V < 40), excluding green and yellow hues
 
-    Requiring ≥2 signals dramatically reduces false positives from:
-      - Road shadows (dark but not blue)
-      - Rooftop reflections (sometimes blue-ish)
-      - Dark tree patches (dark green, signal 3+4 but not 1+2)
+    Post-contour shape filters (conservative — false negatives preferred):
+      - Minimum area: 1000 px (was 200) — eliminates drainage noise
+      - Maximum aspect ratio: 8.0 — rejects road/path shadows
+      - Minimum compactness: 0.06 — rejects linear shadows
 
-    Minimum water body: 200 px (connected component filter removes
-    isolated noise specks that pass the combined threshold).
+    Logs: "Water raw: X contours → after shape filter: Y"
     """
     cv2 = _get_cv2()
     t   = THRESHOLDS["water"]
@@ -676,36 +763,61 @@ def _detect_water(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
     g = img_rgb[:, :, 1].astype(np.float32)
     b = img_rgb[:, :, 2].astype(np.float32)
 
-    # Signal 1: NDWI approximation
+    # Signal 1: NDWI approximation (stricter threshold)
     ndwi         = (g - r) / (g + r + 1e-6)
     sig_ndwi     = (ndwi > 0.05).astype(np.uint8)
 
-    # Signal 2: Blue channel dominance
+    # Signal 2: Blue channel dominance (stricter ratios — was 1.1/0.9/40)
     sig_blue_dom = (
-        (b > r * 1.1) & (b > g * 0.9) & (b > 40)
+        (b > r * 1.15) & (b > g * 0.85) & (b > 60)
     ).astype(np.uint8)
 
-    # Signal 3: HSV blue/cyan hue
-    mask_hsv = _hsv_mask(img_rgb, t["h"], t["s"], t["v"])
+    # Signal 3: HSV blue/cyan hue (tighter range)
+    mask_hsv = _hsv_mask(img_rgb, (95, 135), (40, 230), (0, 130))
     sig_hsv  = (mask_hsv > 0).astype(np.uint8)
 
-    # Signal 4: Dark regions (V < threshold), exclude dark green (trees)
+    # Signal 4: Dark regions (V < 40), exclude green AND yellow hues
     hsv      = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
-    dark_v   = (hsv[:, :, 2] < t["dark_v_max"]).astype(np.uint8)
-    is_green = (hsv[:, :, 0] >= 30) & (hsv[:, :, 0] <= 90)
-    dark_v[is_green] = 0
+    dark_v   = (hsv[:, :, 2] < 40).astype(np.uint8)
+    is_green_yellow = (hsv[:, :, 0] >= 20) & (hsv[:, :, 0] <= 95)
+    dark_v[is_green_yellow] = 0
     sig_dark = dark_v
 
-    # Require ≥2 signals to agree
+    # Require ≥3 signals (was ≥2 — the cause of 173 false positives)
     signal_sum = sig_ndwi + sig_blue_dom + sig_hsv + sig_dark
-    mask = (signal_sum >= 2).astype(np.uint8) * 255
+    mask = (signal_sum >= 3).astype(np.uint8) * 255
 
     mask = _morph_clean(mask, open_k=7, close_k=11)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    # Minimum water body: 200 px (eliminates isolated noise)
-    MIN_WATER_PX = 200
-    valid = [c for c in contours if cv2.contourArea(c) >= MIN_WATER_PX]
+    raw_count = len(contours)
+
+    # Shape filters — water is conservative: false negatives preferred
+    MIN_WATER_PX     = 1000   # was 200; real water bodies are large
+    MAX_WATER_ASPECT = 8.0    # super-elongated = road shadow, not pond
+    MIN_COMPACTNESS  = 0.06   # very thin = drainage ditch, not hazard
+
+    valid = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < MIN_WATER_PX:
+            continue
+        x, y, w, h = cv2.boundingRect(c)
+        aspect = max(w, h) / max(min(w, h), 1)
+        if aspect > MAX_WATER_ASPECT:
+            continue
+        perimeter = cv2.arcLength(c, True)
+        if perimeter > 0:
+            compactness = 4 * np.pi * area / (perimeter ** 2)
+            if compactness < MIN_COMPACTNESS:
+                continue
+        valid.append(c)
+
+    log.info(
+        f"Water detection: {raw_count} raw contours → "
+        f"{len(valid)} after shape filter (min {MIN_WATER_PX}px, "
+        f"aspect ≤{MAX_WATER_ASPECT}, compactness ≥{MIN_COMPACTNESS})"
+    )
     return valid, mask
 
 

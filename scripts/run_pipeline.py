@@ -348,8 +348,13 @@ Examples:
 
     # ── V2: Satellite vision feature detection (UPGRADE 3) ───────────────────
     log.info("\n[V2] Running satellite vision feature detection...")
+    vision_summary = {}
     try:
-        from pipeline.vision_extract import detect_features, merge_vision_with_osm
+        from pipeline.vision_extract import (
+            detect_features,
+            merge_vision_with_osm,
+            refilter_water_strict,
+        )
         vision_summary = detect_features(
             boundary_data["bbox_wgs84"],
             output_dir,
@@ -359,6 +364,39 @@ Examples:
         if vision_summary.get("detections"):
             merge_stats = merge_vision_with_osm(vision_summary, output_dir)
             log.info(f"  Vision detections merged: {merge_stats}")
+
+        # ── Multi-stage validation pass ──────────────────────────────────────
+        # If water is severely over-detected (>25 bodies) apply a strict
+        # post-hoc filter without re-downloading tiles.  Bounded to 1 pass.
+        _det   = vision_summary.get("detections", {})
+        _water = _det.get("water", {}).get("count", 0)
+        _green = _det.get("green", {}).get("count", 0)
+        if _water > 25:
+            log.info(
+                f"\n[V2] Multi-stage pass 2: water over-detected ({_water}) — "
+                f"applying strict post-filter..."
+            )
+            try:
+                _new_water = refilter_water_strict(output_dir)
+                log.info(f"  Water refiltered: {_water} → {_new_water}")
+                # Update vision_summary so QA and validation see correct count
+                if "water" in _det:
+                    _det["water"]["count"] = _new_water
+                vision_summary["detections"] = _det
+                # Update class_filter_debug.json pass 2 entry
+                try:
+                    import json as _json
+                    _cfd_path = output_dir / "class_filter_debug.json"
+                    _cfd      = _json.loads(_cfd_path.read_text(encoding="utf-8"))
+                    _cfd.setdefault("pass2_water_refilter", {})["water"] = {
+                        "before": _water,
+                        "after":  _new_water,
+                    }
+                    _cfd_path.write_text(_json.dumps(_cfd, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
+            except Exception as we:
+                log.warning(f"  Water refilter failed (non-critical): {we}")
 
         # UPGRADE 9: Feature count validation
         try:
@@ -372,6 +410,7 @@ Examples:
             }
             _val_results = validate_feature_counts(_feat_counts)
             write_validation_report(_feat_counts, _val_results, output_dir)
+            log.info(f"  Feature validation: {_val_results}")
         except Exception as ve:
             log.debug(f"Feature validation failed (non-critical): {ve}")
     except Exception as e:
@@ -579,6 +618,41 @@ Examples:
         )
     except Exception as dve:
         log.debug(f"Debug visualizations failed (non-critical): {dve}")
+
+    # course_mask_debug.png — boundary mask overlaid on satellite mosaic
+    try:
+        from pipeline.course_mask import (
+            load_course_polygon,
+            build_raster_mask,
+            generate_course_mask_debug,
+        )
+        from pipeline.vision_extract import _download_satellite_mosaic
+        mosaic_path = output_dir / "satellite_mosaic.jpg"
+        if mosaic_path.exists():
+            # Rebuild mask from boundary_data (no network call needed)
+            _cp = load_course_polygon(boundary_data)
+            if _cp is not None:
+                # Approximate transform from bbox (no actual tile download)
+                _bbox = boundary_data["bbox_wgs84"]
+                import json as _j
+                _vis_sum_path = output_dir / "vision_summary.json"
+                _iw, _ih = 1024, 1024
+                if _vis_sum_path.exists():
+                    try:
+                        _vs = _j.loads(_vis_sum_path.read_text())
+                        _iw, _ih = _vs.get("image_size", [_iw, _ih])
+                    except Exception:
+                        pass
+                _tp = (
+                    _bbox[0],
+                    _bbox[3],
+                    (_bbox[2] - _bbox[0]) / max(_iw, 1),
+                    (_bbox[3] - _bbox[1]) / max(_ih, 1),
+                )
+                _cm = build_raster_mask(_cp, _tp, (_ih, _iw))
+                generate_course_mask_debug(_cm, mosaic_path, output_dir)
+    except Exception as cme:
+        log.debug(f"course_mask_debug generation failed (non-critical): {cme}")
 
     # ── QA ───────────────────────────────────────────────────────────────────
     log.info("\nRunning QA checks...")

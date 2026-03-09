@@ -308,13 +308,17 @@ def _pair_tees_to_greens(tees: List[dict], greens: List[dict]) -> List[dict]:
 
         par = _estimate_par(best_dist)
         holes.append({
-            "hole_number":    hole_num,
-            "tee_position":   {"lon": tee["lon"],   "lat": tee["lat"]},
-            "green_position": {"lon": green["lon"],  "lat": green["lat"]},
-            "distance_m":     round(best_dist, 1),
-            "distance_yards": round(best_dist * 1.09361, 0),
-            "par":            par,
-            "routing_source": "reconstructed",
+            "hole_number":         hole_num,
+            "tee_position":        {"lon": tee["lon"],   "lat": tee["lat"]},
+            "green_position":      {"lon": green["lon"],  "lat": green["lat"]},
+            "distance_m":          round(best_dist, 1),
+            "distance_yards":      round(best_dist * 1.09361, 0),
+            "estimated_length_m":  round(best_dist, 1),
+            "estimated_length_yd": round(best_dist * 1.09361, 0),
+            "par":                 par,
+            "routing_source":      "reconstructed",
+            "confidence":          0.55,
+            "source_mix":          f"{tee.get('source','unknown')}+{green.get('source','unknown')}",
         })
         hole_num += 1
 
@@ -843,8 +847,8 @@ def _multi_segment_routing(
         n = len(fw_itm)
         log.info(f"Fairway graph nodes: {n}")
 
-        # Build adjacency at 25m threshold
-        ADJACENCY_M = 25.0
+        # Build adjacency at 50m threshold (was 25m — too sparse for tree-separated fairways)
+        ADJACENCY_M = 50.0
         edges: List[Tuple[int, int]] = []
         for i in range(n):
             for j in range(i + 1, n):
@@ -853,7 +857,7 @@ def _multi_segment_routing(
                         edges.append((i, j))
                 except Exception:
                     pass
-        log.info(f"Fairway graph edges: {len(edges)}")
+        log.info(f"Fairway graph edges: {len(edges)} (adjacency threshold: {ADJACENCY_M}m)")
 
         # Union-Find
         parent = list(range(n))
@@ -951,15 +955,25 @@ def _multi_segment_routing(
             assigned_greens.add(best_gi)
             _, _, green = greens_itm[best_gi]
 
+            # Confidence: higher when a real tee was found nearby
+            tee_confidence = 0.75 if best_tee_dist < 150 else 0.55
+            green_source   = green.get("source", "unknown")
+            tee_source     = tees[0].get("source", "unknown") if tees else "unknown"
+            source_mix     = f"fairway_graph+{green_source}"
+
             holes.append({
-                "hole_number":      hole_num,
-                "tee_position":     {"lon": tee_lon, "lat": tee_lat},
-                "green_position":   {"lon": green["lon"], "lat": green["lat"]},
-                "distance_m":       round(best_dist, 1),
-                "distance_yards":   round(best_dist * 1.09361, 0),
-                "par":              _estimate_par(best_dist),
-                "routing_source":   "multi_segment",
-                "fairway_segments": len(comp_indices),
+                "hole_number":         hole_num,
+                "tee_position":        {"lon": tee_lon, "lat": tee_lat},
+                "green_position":      {"lon": green["lon"], "lat": green["lat"]},
+                "distance_m":          round(best_dist, 1),
+                "distance_yards":      round(best_dist * 1.09361, 0),
+                "estimated_length_m":  round(best_dist, 1),
+                "estimated_length_yd": round(best_dist * 1.09361, 0),
+                "par":                 _estimate_par(best_dist),
+                "routing_source":      "multi_segment",
+                "fairway_segments":    len(comp_indices),
+                "confidence":          round(tee_confidence, 2),
+                "source_mix":          source_mix,
             })
             hole_num += 1
 
