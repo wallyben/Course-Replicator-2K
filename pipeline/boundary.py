@@ -43,18 +43,30 @@ from pyproj import Transformer
 
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+import importlib.util as _ilu
+
+# ── Robust config import ──────────────────────────────────────────────────────
+# Always load from the project-root config.py by absolute path so that a
+# same-named third-party package (e.g. PyPI "config") cannot shadow it.
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.py")
+if "config" not in sys.modules or not hasattr(sys.modules["config"], "OVERPASS_URL"):
+    _spec = _ilu.spec_from_file_location("config", _CONFIG_PATH)
+    _mod  = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    sys.modules["config"] = _mod
 import config
+# Also ensure the project root is on sys.path for sub-modules
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 log = logging.getLogger(__name__)
 
 # ─── Overpass endpoint pool ───────────────────────────────────────────────────
 # Populated from config; shuffled randomly per request to distribute load and
 # work around per-endpoint rate limits (HTTP 429).
-_OVERPASS_ENDPOINTS: List[str] = getattr(
-    config, "OVERPASS_ENDPOINTS",
-    [config.OVERPASS_URL],
-)
+# NOTE: getattr default arg is evaluated eagerly by Python, so we compute it
+# lazily to avoid AttributeError when a non-project config module is cached.
+_OVERPASS_ENDPOINTS: List[str] = getattr(config, "OVERPASS_ENDPOINTS", None) or \
+    [getattr(config, "OVERPASS_URL", "https://overpass-api.de/api/interpreter")]
 
 # ─── Area constraints ─────────────────────────────────────────────────────────
 _BBOX_AREA_MIN_M2   = 40  * 10_000   # 40 ha  — smallest real 18-hole course

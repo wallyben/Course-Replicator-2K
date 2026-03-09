@@ -26,8 +26,15 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+import importlib.util as _ilu
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.py")
+if "config" not in sys.modules or not hasattr(sys.modules["config"], "OVERPASS_URL"):
+    _spec = _ilu.spec_from_file_location("config", _CONFIG_PATH)
+    _mod  = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    sys.modules["config"] = _mod
 import config
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 log = logging.getLogger(__name__)
 

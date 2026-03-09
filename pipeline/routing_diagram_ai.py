@@ -65,9 +65,26 @@ def _require_cv2():
 
 
 def _try_pytesseract():
-    """Return pytesseract module or None if not installed."""
+    """Return pytesseract module or None if not installed/configured."""
     try:
         import pytesseract
+        # Allow config.TESSERACT_CMD to point to non-default tesseract binary
+        try:
+            import sys, os, importlib.util as _ilu
+            _cfg_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.py"
+            )
+            if "config" not in sys.modules or not hasattr(sys.modules["config"], "OVERPASS_URL"):
+                _spec = _ilu.spec_from_file_location("config", _cfg_path)
+                _mod  = _ilu.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                sys.modules["config"] = _mod
+            import config as _cfg
+            _cmd = getattr(_cfg, "TESSERACT_CMD", "")
+            if _cmd:
+                pytesseract.pytesseract.tesseract_cmd = _cmd
+        except Exception:
+            pass
         pytesseract.get_tesseract_version()   # verify binary is present
         return pytesseract
     except Exception:
