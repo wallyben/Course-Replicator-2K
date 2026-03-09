@@ -28,7 +28,7 @@ def _load_json(filename: str) -> dict:
     path = COURSE_DIR / filename
     if not path.exists():
         return {}
-    return json.loads(path.read_text())
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _load_instructions() -> list:
@@ -167,7 +167,7 @@ def full_guide():
     """Serve the pre-generated full HTML guide if available."""
     guide_path = COURSE_DIR / "build_guide.html"
     if guide_path.exists():
-        return guide_path.read_text()
+        return guide_path.read_text(encoding="utf-8")
     abort(404)
 
 
@@ -176,7 +176,7 @@ def qa_report():
     """Serve the pre-generated QA report if available."""
     qa_path = COURSE_DIR / "qa_report.html"
     if qa_path.exists():
-        return qa_path.read_text()
+        return qa_path.read_text(encoding="utf-8")
     abort(404)
 
 

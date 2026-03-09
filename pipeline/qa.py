@@ -59,6 +59,18 @@ def run_qa(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     holes  = features_data["holes"]
+
+    # Supplement hole list from routing inference when OSM data is sparse
+    _routing_meta_path = output_dir / "holes_metadata.json"
+    if not holes and _routing_meta_path.exists():
+        try:
+            _rm = json.loads(_routing_meta_path.read_text(encoding="utf-8"))
+            if _rm.get("source") == "routing_inference" and _rm.get("hole_count", 0) > 0:
+                holes = [{"hole_number": i + 1} for i in range(_rm["hole_count"])]
+                log.debug(f"QA: supplemented {len(holes)} holes from routing_inference")
+        except Exception:
+            pass
+
     report = {
         "course_name":    boundary_data["matched_name"],
         "total_holes":    len(holes),
@@ -100,7 +112,7 @@ def run_qa(
 
     # Write report
     qa_json_path = output_dir / "qa_report.json"
-    qa_json_path.write_text(json.dumps(report, indent=2))
+    qa_json_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     qa_html_path = output_dir / "qa_report.html"
     _write_qa_html(report, qa_html_path)
@@ -426,5 +438,5 @@ ul {{ margin: 0.5em 0; padding-left: 1.5em; }}
 </body>
 </html>"""
 
-    out_path.write_text(html)
+    out_path.write_text(html, encoding="utf-8")
     log.info(f"QA report written: {out_path}")

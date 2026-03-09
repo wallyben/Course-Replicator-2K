@@ -69,24 +69,24 @@ THRESHOLDS = {
         "h": (35, 85),   # green-yellow hue
         "s": (40, 220),  # moderately saturated
         "v": (50, 200),  # not too dark, not bleached
-        "min_area_px": 400,
+        "min_area_px": 500,
         "texture_max": 35,   # fairways are uniform
     },
     "green": {
         "h": (38, 82),   # brighter green
         "s": (50, 210),
         "v": (60, 195),
-        "min_area_px": 60,
-        "max_area_px": 700,
-        "circularity_min": 0.38,  # putting greens are roundish
+        "min_area_px": 80,
+        "max_area_px": 400,
+        "circularity_min": 0.50,  # putting greens are roundish (tighter)
         "texture_max": 30,        # very uniform surface
     },
     "bunker": {
         "h": (14, 42),   # pale yellow → beige → tan
         "s": (15, 110),  # low saturation (sand)
         "v": (155, 255), # bright (sand reflects light)
-        "min_area_px": 20,
-        "max_area_px": 1500,
+        "min_area_px": 80,
+        "max_area_px": 600,
     },
     "water": {
         "h": (90, 140),  # blue-cyan
@@ -111,6 +111,25 @@ THRESHOLDS = {
         "texture_range": (12, 45),  # medium texture (not as smooth as fairway)
     },
 }
+
+
+# ─── Geometric filter constants ───────────────────────────────────────────────
+# These control false-positive suppression. Increase to reduce detections,
+# decrease to recover more features. Values are in pixels² or ratios.
+
+# Bunkers: small-to-medium irregular sand patches
+MIN_BUNKER_AREA_PX  = 80    # ignore tiny noise (was 20)
+MAX_BUNKER_AREA_PX  = 600   # ignore oversized patches/paths (was 1500)
+MAX_BUNKER_ASPECT   = 4.0   # bounding-box long/short ratio — bunkers aren't thin lines
+
+# Greens: small, compact, circular putting surfaces
+MIN_GREEN_AREA_PX   = 80    # minimum size (was 60)
+MAX_GREEN_AREA_PX   = 400   # maximum size (was 700) — greens are small
+MIN_GREEN_CIRC      = 0.50  # circularity threshold (was 0.38) — stricter roundness
+
+# Fairways: large, elongated corridors
+MIN_FAIRWAY_AREA_PX = 500   # must be a substantial patch (was 400)
+MIN_FAIRWAY_ASPECT  = 1.5   # must be elongated, not a circular blob
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
@@ -192,7 +211,7 @@ def detect_features(
         "image_size": [img_arr.shape[1], img_arr.shape[0]],
         "detections": detections,
     }
-    (output_dir / "vision_summary.json").write_text(json.dumps(summary, indent=2))
+    (output_dir / "vision_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
 
 
@@ -451,6 +470,7 @@ def _morph_clean(mask: np.ndarray, open_k: int = 5, close_k: int = 7) -> np.ndar
 def _detect_fairways(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
     """
     Detect fairway regions: bright green, elongated, uniform texture.
+    Geometric filter: must be large enough and elongated (not circular).
     """
     cv2 = _get_cv2()
     t = THRESHOLDS["fairway"]
@@ -462,14 +482,25 @@ def _detect_fairways(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
     mask = _morph_clean(mask, open_k=7, close_k=9)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    valid = [c for c in contours if cv2.contourArea(c) >= t["min_area_px"]]
+    valid = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < MIN_FAIRWAY_AREA_PX:
+            continue
+        # Fairways are elongated — reject near-circular blobs
+        x, y, w, h = cv2.boundingRect(c)
+        aspect = max(w, h) / max(min(w, h), 1)
+        if aspect < MIN_FAIRWAY_ASPECT:
+            continue
+        valid.append(c)
     return valid, mask
 
 
 def _detect_greens(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
     """
     Detect putting greens: small, circular, very uniform green patches.
-    Uses combined HSV mask + circularity + texture filters.
+    Uses combined HSV mask + circularity + size + texture filters.
+    Geometric filters: MIN/MAX_GREEN_AREA_PX, MIN_GREEN_CIRC.
     """
     cv2 = _get_cv2()
     t = THRESHOLDS["green"]
@@ -484,13 +515,13 @@ def _detect_greens(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
     candidates = []
     for c in contours:
         area = cv2.contourArea(c)
-        if area < t["min_area_px"] or area > t["max_area_px"]:
+        if area < MIN_GREEN_AREA_PX or area > MAX_GREEN_AREA_PX:
             continue
         perim = cv2.arcLength(c, True)
         if perim < 1:
             continue
         circularity = 4 * np.pi * area / (perim ** 2)
-        if circularity < t["circularity_min"]:
+        if circularity < MIN_GREEN_CIRC:
             continue
         candidates.append(c)
 
@@ -500,6 +531,8 @@ def _detect_greens(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
 def _detect_bunkers(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
     """
     Detect bunkers: light sand-coloured bright irregular patches.
+    Geometric filters: MIN/MAX_BUNKER_AREA_PX, MAX_BUNKER_ASPECT.
+    Aspect ratio cap removes thin paths and road markings mis-classified as sand.
     """
     cv2 = _get_cv2()
     t = THRESHOLDS["bunker"]
@@ -508,10 +541,17 @@ def _detect_bunkers(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
     mask = _morph_clean(mask, open_k=3, close_k=5)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    valid = [
-        c for c in contours
-        if t["min_area_px"] <= cv2.contourArea(c) <= t["max_area_px"]
-    ]
+    valid = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if not (MIN_BUNKER_AREA_PX <= area <= MAX_BUNKER_AREA_PX):
+            continue
+        # Reject very thin elongated shapes (paths, kerbs, etc.)
+        x, y, w, h = cv2.boundingRect(c)
+        aspect = max(w, h) / max(min(w, h), 1)
+        if aspect > MAX_BUNKER_ASPECT:
+            continue
+        valid.append(c)
     return valid, mask
 
 
@@ -685,13 +725,13 @@ def _save_detection_overlay(
 def _write_geojson_features(features: list, out_path: Path) -> None:
     out_path.write_text(json.dumps(
         {"type": "FeatureCollection", "features": features}, indent=2
-    ))
+    ), encoding="utf-8")
 
 
 def _load_geojson(path: Path) -> list:
     if not path.exists():
         return []
     try:
-        return json.loads(path.read_text()).get("features", [])
+        return json.loads(path.read_text(encoding="utf-8")).get("features", [])
     except Exception:
         return []

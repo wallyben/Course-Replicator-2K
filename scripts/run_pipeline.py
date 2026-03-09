@@ -125,7 +125,7 @@ Examples:
 
     if boundary_path.exists():
         log.info("  Using cached boundary.")
-        boundary_data = json.loads(boundary_path.read_text())
+        boundary_data = json.loads(boundary_path.read_text(encoding="utf-8"))
     else:
         from pipeline.boundary import resolve_boundary, boundary_from_bbox
 
@@ -148,7 +148,7 @@ Examples:
                 )
                 sys.exit(1)
 
-        boundary_path.write_text(json.dumps(boundary_data, indent=2))
+        boundary_path.write_text(json.dumps(boundary_data, indent=2), encoding="utf-8")
         log.info(f"  Matched: {boundary_data['matched_name']!r} "
                  f"(confidence: {boundary_data['confidence']})")
         log.info(f"  Area: {boundary_data['area_m2']/10000:.1f} hectares")
@@ -209,7 +209,7 @@ Examples:
 
     if terrain_stats_path.exists():
         log.info("  Using cached terrain stats.")
-        terrain_stats = json.loads(terrain_stats_path.read_text())
+        terrain_stats = json.loads(terrain_stats_path.read_text(encoding="utf-8"))
     else:
         from pipeline.terrain import process_terrain
         try:
@@ -232,7 +232,7 @@ Examples:
             "features_geojson": str(features_path),
             "holes_metadata":   str(holes_path),
             "feature_map_path": str(output_dir / "feature_map.png"),
-            "holes":            json.loads(holes_path.read_text()) if holes_path.exists() else [],
+            "holes":            json.loads(holes_path.read_text(encoding="utf-8")) if holes_path.exists() else [],
             "hole_count":       0,
             "feature_counts":   {},
             "confidence_summary": {},
@@ -280,7 +280,7 @@ Examples:
             _holes_meta = output_dir / "holes_metadata.json"
             routing_data = {
                 "hole_count": features_data.get("hole_count", 0),
-                "holes":      _json.loads(_holes_meta.read_text()) if _holes_meta.exists() else [],
+                "holes":      _json.loads(_holes_meta.read_text(encoding="utf-8")) if _holes_meta.exists() else [],
                 "holes_path": str(routing_path),
             }
         except Exception:
@@ -308,7 +308,7 @@ Examples:
     if args.scorecard:
         sc_path = Path(args.scorecard)
         if sc_path.exists():
-            scorecard = json.loads(sc_path.read_text())
+            scorecard = json.loads(sc_path.read_text(encoding="utf-8"))
             log.info(f"  Loaded scorecard: {len(scorecard)} holes")
         else:
             log.warning(f"  Scorecard file not found: {sc_path}")

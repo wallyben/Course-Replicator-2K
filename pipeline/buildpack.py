@@ -95,7 +95,7 @@ def generate_enhanced_buildpack(
         routing_data, course_type, feature_paths
     )
     manifest_path = output_dir / "course_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2))
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     outputs["course_manifest"] = str(manifest_path)
     log.info("Course manifest written")
 
@@ -106,7 +106,7 @@ def generate_enhanced_buildpack(
             boundary_data, terrain_stats, routing_data,
             feature_paths, output_dir
         )
-        spec_path.write_text(json.dumps(build_spec, indent=2))
+        spec_path.write_text(json.dumps(build_spec, indent=2), encoding="utf-8")
         outputs["pga2k_build_spec"] = str(spec_path)
         log.info(f"PGA 2K build spec: {spec_path.name}")
     except Exception as e:
@@ -202,7 +202,7 @@ def _generate_trees_geojson(output_dir: Path, out_path: Path) -> None:
                 continue
 
     geojson = {"type": "FeatureCollection", "features": tree_features}
-    out_path.write_text(json.dumps(geojson, indent=2))
+    out_path.write_text(json.dumps(geojson, indent=2), encoding="utf-8")
     log.debug(f"trees.geojson: {len(tree_features)} features")
 
 
@@ -503,7 +503,7 @@ def _load_geojson_features(path: Path) -> list:
     if not path.exists():
         return []
     try:
-        return json.loads(path.read_text()).get("features", [])
+        return json.loads(path.read_text(encoding="utf-8")).get("features", [])
     except Exception:
         return []
 
@@ -544,7 +544,7 @@ def _generate_vegetation_zones(
         veg_mapping[4]["vegetation"] = "woodland_trees"
         veg_mapping[3]["vegetation"] = "tree_rough"
 
-    regions_data = json.loads(regions_path.read_text())
+    regions_data = json.loads(regions_path.read_text(encoding="utf-8"))
     features = []
     for feat in regions_data.get("features", []):
         cls = feat.get("properties", {}).get("class", 0)
@@ -561,7 +561,7 @@ def _generate_vegetation_zones(
         features.append(new_feat)
 
     geojson = {"type": "FeatureCollection", "features": features}
-    out_path.write_text(json.dumps(geojson, indent=2))
+    out_path.write_text(json.dumps(geojson, indent=2), encoding="utf-8")
 
 
 # ─── Collect existing outputs ─────────────────────────────────────────────────

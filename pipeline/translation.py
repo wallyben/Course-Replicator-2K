@@ -88,7 +88,7 @@ def generate_build_pack(
 
     # Write build instructions JSON
     instructions_path = output_dir / "build_instructions.json"
-    instructions_path.write_text(json.dumps(all_instructions, indent=2))
+    instructions_path.write_text(json.dumps(all_instructions, indent=2), encoding="utf-8")
 
     # Compile course metadata
     total_yards = sum(
@@ -115,7 +115,7 @@ def generate_build_pack(
     }
 
     metadata_path = output_dir / "course_metadata.json"
-    metadata_path.write_text(json.dumps(metadata, indent=2))
+    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
     # Estimate fidelity
     fidelity = _estimate_fidelity(boundary_data, terrain_stats, features_data)

@@ -160,11 +160,11 @@ def extract_features(boundary_data: dict, output_dir: Path) -> dict:
     # Write GeoJSON
     geojson = {"type": "FeatureCollection", "features": features}
     geojson_path = output_dir / "features.geojson"
-    geojson_path.write_text(json.dumps(geojson, indent=2))
+    geojson_path.write_text(json.dumps(geojson, indent=2), encoding="utf-8")
 
     # Write holes metadata
     holes_path = output_dir / "holes_metadata.json"
-    holes_path.write_text(json.dumps(holes, indent=2))
+    holes_path.write_text(json.dumps(holes, indent=2), encoding="utf-8")
 
     # Render feature map
     feature_map_path = output_dir / "feature_map.png"

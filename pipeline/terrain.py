@@ -180,7 +180,7 @@ def process_terrain(dtm_path: Path, boundary_data: dict, output_dir: Path) -> di
     }
 
     stats_path = output_dir / "terrain_stats.json"
-    stats_path.write_text(json.dumps(stats, indent=2))
+    stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
     log.info(f"Terrain stats written to {stats_path}")
 
     return stats
@@ -528,7 +528,7 @@ def _export_terrain_regions_geojson(
             })
 
     geojson = {"type": "FeatureCollection", "features": features}
-    out_path.write_text(json.dumps(geojson, indent=2))
+    out_path.write_text(json.dumps(geojson, indent=2), encoding="utf-8")
 
 
 # ─── Utility: write classified raster ────────────────────────────────────────

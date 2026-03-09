@@ -109,7 +109,7 @@ def extract_osm_features(boundary_data: dict, output_dir: Path) -> dict:
         "output_paths": output_paths,
     }
     summary_path = output_dir / "osm_features_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2))
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     return summary
 
@@ -298,7 +298,7 @@ def _write_geojson(features: list, out_path: Path) -> None:
         "type": "FeatureCollection",
         "features": features,
     }
-    out_path.write_text(json.dumps(geojson, indent=2))
+    out_path.write_text(json.dumps(geojson, indent=2), encoding="utf-8")
 
 
 def load_geojson_features(path: Path) -> list:
@@ -306,7 +306,7 @@ def load_geojson_features(path: Path) -> list:
     if not path.exists():
         return []
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
         return data.get("features", [])
     except Exception:
         return []

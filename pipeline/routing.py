@@ -83,6 +83,13 @@ def reconstruct_routing(
     _write_holes_geojson(holes, holes_path)
     log.info(f"Routing: {len(holes)} holes written to {holes_path.name}")
 
+    # Write holes_metadata.json so QA can read the routing hole count
+    meta_path = output_dir / "holes_metadata.json"
+    meta_path.write_text(json.dumps({
+        "hole_count": len(holes),
+        "source":     "routing_inference",
+    }, indent=2), encoding="utf-8")
+
     return {
         "hole_count":  len(holes),
         "holes":       holes,
@@ -489,13 +496,13 @@ def _write_holes_geojson(holes: List[dict], out_path: Path) -> None:
             })
 
     geojson = {"type": "FeatureCollection", "features": features}
-    out_path.write_text(json.dumps(geojson, indent=2))
+    out_path.write_text(json.dumps(geojson, indent=2), encoding="utf-8")
 
 
 def _load_geojson_features(path: Path) -> list:
     if not path.exists():
         return []
     try:
-        return json.loads(path.read_text()).get("features", [])
+        return json.loads(path.read_text(encoding="utf-8")).get("features", [])
     except Exception:
         return []
