@@ -1,5 +1,26 @@
 {% extends "base.html" %}
 
+{% block head %}
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+#courseMap { height: 420px; border-radius: 8px; border: 1px solid var(--border); }
+.layer-toggle { display: flex; flex-wrap: wrap; gap: 0.4em; margin-bottom: 0.75em; }
+.layer-btn {
+  padding: 0.25em 0.65em; border-radius: 4px; font-size: 0.78em; cursor: pointer;
+  border: 1px solid var(--border); background: var(--bg2); color: var(--text-dim);
+  user-select: none; transition: background 0.15s;
+}
+.layer-btn.active { color: #fff; border-color: transparent; }
+.layer-btn[data-layer="routing"]  { background: #1976d2; }
+.layer-btn[data-layer="greens"]   { background: #2e7d32; }
+.layer-btn[data-layer="fairways"] { background: #558b2f; }
+.layer-btn[data-layer="bunkers"]  { background: #a1887f; }
+.layer-btn[data-layer="tees"]     { background: #1565c0; }
+.layer-btn[data-layer="water"]    { background: #1565c0; }
+.layer-btn:not(.active) { background: var(--bg2) !important; }
+</style>
+{% endblock %}
+
 {% block title %}{{ course_name }} — Course Overview{% endblock %}
 
 {% block course_name %}{{ course_name }}{% endblock %}
@@ -93,6 +114,22 @@
 
 </section>
 
+<!-- Interactive Map -->
+<section style="margin-bottom:2em;">
+  <h2 style="color:var(--blue);margin-bottom:0.5em;">Live Course Map</h2>
+
+  <div class="layer-toggle" id="layerToggles">
+    <span class="layer-btn active" data-layer="routing">Routing</span>
+    <span class="layer-btn active" data-layer="greens">Greens</span>
+    <span class="layer-btn active" data-layer="fairways">Fairways</span>
+    <span class="layer-btn active" data-layer="bunkers">Bunkers</span>
+    <span class="layer-btn active" data-layer="tees">Tees</span>
+    <span class="layer-btn active" data-layer="water">Water</span>
+  </div>
+
+  <div id="courseMap"></div>
+</section>
+
 <!-- Hole grid -->
 <section>
   <h2 style="color:var(--blue);margin-bottom:0.75em;">18 Holes</h2>
@@ -115,4 +152,85 @@
   </div>
 </section>
 
+{% endblock %}
+
+{% block scripts %}
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(async function() {
+  let centre = [53.0, -6.5], zoom = 14;
+  try {
+    const b = await fetch('/api/bounds').then(r => r.json());
+    if (b.centre && b.centre[0] !== 0) {
+      centre = [b.centre[1], b.centre[0]];
+    }
+  } catch(e) {}
+
+  const map = L.map('courseMap').setView(centre, zoom);
+  L.tileLayer(
+    'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    { attribution: 'ESRI World Imagery', maxZoom: 19 }
+  ).addTo(map);
+
+  const layerDefs = {
+    routing:  { url: '/api/geojson/holes',    color: '#ffffff', weight: 2, fillOpacity: 0 },
+    greens:   { url: '/api/geojson/greens',   color: '#2e7d32', fillColor: '#4caf50', fillOpacity: 0.55 },
+    fairways: { url: '/api/geojson/fairways', color: '#558b2f', fillColor: '#8bc34a', fillOpacity: 0.35 },
+    bunkers:  { url: '/api/geojson/bunkers',  color: '#a1887f', fillColor: '#d7ccc8', fillOpacity: 0.65 },
+    tees:     { url: '/api/geojson/tees',     color: '#1565c0', fillColor: '#42a5f5', fillOpacity: 0.6  },
+    water:    { url: '/api/geojson/water',    color: '#0d47a1', fillColor: '#1e88e5', fillOpacity: 0.5  },
+  };
+
+  const activeLayers = {};
+
+  async function loadLayer(name) {
+    const def = layerDefs[name];
+    try {
+      const data = await fetch(def.url).then(r => r.json());
+      const layer = L.geoJSON(data, {
+        style: () => ({
+          color: def.color, weight: def.weight || 1.5,
+          fillColor: def.fillColor || def.color, fillOpacity: def.fillOpacity || 0.4,
+        }),
+        onEachFeature: (feature, layer) => {
+          const p = feature.properties || {};
+          const parts = [];
+          if (p.hole_number)    parts.push(`Hole ${p.hole_number}`);
+          if (p.type)           parts.push(p.type);
+          if (p.confidence)     parts.push(`Conf: ${(p.confidence*100).toFixed(0)}%`);
+          if (p.distance_yards) parts.push(`${p.distance_yards}y`);
+          if (parts.length) layer.bindTooltip(parts.join(' · '));
+        },
+        pointToLayer: (feature, latlng) =>
+          L.circleMarker(latlng, {
+            radius: 6, color: def.color,
+            fillColor: def.fillColor || def.color,
+            fillOpacity: 0.8, weight: 2,
+          }),
+      });
+      activeLayers[name] = layer;
+      layer.addTo(map);
+    } catch(e) {}
+  }
+
+  for (const name of Object.keys(layerDefs)) {
+    await loadLayer(name);
+  }
+
+  if (activeLayers.routing && activeLayers.routing.getBounds && activeLayers.routing.getBounds().isValid()) {
+    map.fitBounds(activeLayers.routing.getBounds().pad(0.1));
+  } else if (activeLayers.fairways && activeLayers.fairways.getBounds().isValid()) {
+    map.fitBounds(activeLayers.fairways.getBounds().pad(0.1));
+  }
+
+  document.querySelectorAll('.layer-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const name = btn.dataset.layer, layer = activeLayers[name];
+      if (!layer) return;
+      if (map.hasLayer(layer)) { map.removeLayer(layer); btn.classList.remove('active'); }
+      else                     { layer.addTo(map);       btn.classList.add('active'); }
+    });
+  });
+})();
+</script>
 {% endblock %}

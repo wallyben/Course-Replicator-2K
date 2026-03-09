@@ -153,17 +153,19 @@ def _compute_scale(boundary_data: dict, terrain_stats: dict) -> dict:
     height_m = bounds[3] - bounds[1]
     max_dim_m = max(width_m, height_m)
 
-    # How many real metres per 2K yard
-    # If course fits in canvas, scale 1:1 in yards
-    canvas_m = config.TK2_CANVAS_YARDS * 0.9144   # yards → metres
+    # Step 8: Course scale normalisation.
+    # Use PGA_2K_CANVAS_M (metres) for the primary check; fall back to yards.
+    canvas_m = getattr(config, "PGA_2K_CANVAS_M", config.TK2_CANVAS_YARDS * 0.9144)
     if max_dim_m <= canvas_m:
-        metres_per_yard = 0.9144   # 1 yard = 0.9144m exactly
+        metres_per_yard = 0.9144   # 1 yard = 0.9144m — no scaling needed
     else:
-        # Course is larger than 2K canvas — scale down
+        # Course exceeds canvas — scale proportionally, preserving hole ratios
         metres_per_yard = max_dim_m / config.TK2_CANVAS_YARDS
+        scale_factor    = canvas_m / max_dim_m
         log.warning(
-            f"Course dimension ({max_dim_m:.0f}m) exceeds 2K canvas "
-            f"({canvas_m:.0f}m). Scale factor: {metres_per_yard:.3f} m/yd"
+            f"Course scale normalisation: {max_dim_m:.0f}m exceeds 2K canvas "
+            f"({canvas_m:.0f}m). Scale factor: {scale_factor:.3f} "
+            f"({metres_per_yard:.3f} m/yd) — hole ratios preserved."
         )
 
     yards_per_metre  = 1.0 / metres_per_yard

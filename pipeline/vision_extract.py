@@ -280,9 +280,40 @@ def merge_vision_with_osm(
                     pass
 
         if added:
-            merged = osm_feats + added
-            _write_geojson_features(merged, osm_path)
-            log.info(f"Vision merge: +{len(added)} {feat_type}(s) → {osm_path.name}")
+            # Step 7: Multi-source fusion — merge overlapping geometries rather
+            # than blindly appending.  For each vision feature that partially
+            # overlaps an OSM feature, union the two geometries into one.
+            fused_added = []
+            for vf in added:
+                try:
+                    vg = shape(vf["geometry"])
+                    merged_with_osm = False
+                    for idx, of in enumerate(osm_feats):
+                        if not of.get("geometry"):
+                            continue
+                        og = shape(of["geometry"])
+                        if og.intersects(vg):
+                            try:
+                                union_geom = og.union(vg)
+                                if union_geom.is_valid and not union_geom.is_empty:
+                                    from shapely.geometry import mapping
+                                    osm_feats[idx]["geometry"] = mapping(union_geom)
+                                    osm_feats[idx]["properties"]["source"] = "osm+vision"
+                                    merged_with_osm = True
+                                    break
+                            except Exception:
+                                pass
+                    if not merged_with_osm:
+                        fused_added.append(vf)
+                except Exception:
+                    fused_added.append(vf)
+
+            merged_feats = osm_feats + fused_added
+            _write_geojson_features(merged_feats, osm_path)
+            log.info(
+                f"Vision merge [{feat_type}]: +{len(fused_added)} new, "
+                f"{len(added) - len(fused_added)} merged with OSM → {osm_path.name}"
+            )
 
         stats[feat_type] = len(added)
 
@@ -629,8 +660,18 @@ def _save_detections_geojson(
     feature_type: str,
     out_path: Path,
 ) -> None:
-    """Convert pixel contours → WGS84 GeoJSON polygons and save."""
+    """
+    Convert pixel contours → WGS84 GeoJSON polygons, apply real-world m² area
+    filters from config, and save.
+
+    Real-world filter thresholds (config.py):
+      bunker:  MIN_BUNKER_AREA_M2 – MAX_BUNKER_AREA_M2
+      green:   MIN_GREEN_AREA_M2  – MAX_GREEN_AREA_M2
+      fairway: MIN_FAIRWAY_AREA_M2+
+    """
     from shapely.geometry import Polygon, mapping
+    from shapely.ops import transform as shp_transform
+    from pyproj import Transformer
     cv2 = _get_cv2()
 
     if transform_params is None:
@@ -639,6 +680,23 @@ def _save_detections_geojson(
 
     west, north, lon_per_px, lat_per_px = transform_params
     features = []
+
+    # Build a WGS84→ITM projector for metric area calculation
+    try:
+        t_to_itm = Transformer.from_crs("EPSG:4326", "EPSG:2157", always_xy=True)
+    except Exception:
+        t_to_itm = None
+
+    # Real-world area bounds per feature type (m²) — from config
+    area_bounds = {
+        "bunker":  (config.MIN_BUNKER_AREA_M2,  config.MAX_BUNKER_AREA_M2),
+        "green":   (config.MIN_GREEN_AREA_M2,   config.MAX_GREEN_AREA_M2),
+        "fairway": (config.MIN_FAIRWAY_AREA_M2, None),
+    }
+    min_m2, max_m2 = area_bounds.get(feature_type, (None, None))
+
+    total_in  = len(contours)
+    total_out = 0
 
     for contour in contours:
         pts = contour.squeeze()
@@ -659,20 +717,81 @@ def _save_detections_geojson(
                 poly = poly.buffer(0)
             if poly.is_empty or poly.area < 1e-12:
                 continue
+
+            # Real-world m² area filter
+            if (min_m2 is not None or max_m2 is not None) and t_to_itm is not None:
+                try:
+                    poly_itm  = shp_transform(t_to_itm.transform, poly)
+                    area_m2   = poly_itm.area
+                    if min_m2 is not None and area_m2 < min_m2:
+                        continue
+                    if max_m2 is not None and area_m2 > max_m2:
+                        continue
+                except Exception:
+                    pass  # if projection fails, keep the feature
+
+            # Confidence score: higher for features in the expected size range
+            confidence = _vision_confidence(feature_type, poly, t_to_itm)
+
             features.append({
                 "type": "Feature",
                 "geometry": mapping(poly),
                 "properties": {
-                    "type":     feature_type,
-                    "source":   "vision",
-                    "area_px":  float(cv2.contourArea(contour)),
-                    "confidence": 0.6,  # vision detections are medium confidence
+                    "type":       feature_type,
+                    "source":     "vision",
+                    "area_px":    float(cv2.contourArea(contour)),
+                    "confidence": confidence,
                 },
             })
+            total_out += 1
         except Exception:
             continue
 
+    if total_in != total_out:
+        log.info(f"Vision filter applied — {total_in} → {total_out} {feature_type}s retained")
+
     _write_geojson_features(features, out_path)
+
+
+def _vision_confidence(
+    feature_type: str,
+    poly_wgs84,
+    t_to_itm,
+) -> float:
+    """
+    Compute a confidence score (0.0–1.0) for a vision-detected feature.
+
+    Considers:
+      - Whether the feature area is within the expected range (config)
+      - Shape validity
+    """
+    base = 0.55  # vision detections start at MEDIUM confidence
+
+    area_bounds = {
+        "bunker":  (config.MIN_BUNKER_AREA_M2,  config.MAX_BUNKER_AREA_M2),
+        "green":   (config.MIN_GREEN_AREA_M2,   config.MAX_GREEN_AREA_M2),
+        "fairway": (config.MIN_FAIRWAY_AREA_M2, None),
+    }
+    min_m2, max_m2 = area_bounds.get(feature_type, (None, None))
+
+    if t_to_itm is not None and (min_m2 or max_m2):
+        try:
+            from shapely.ops import transform as shp_transform
+            poly_itm = shp_transform(t_to_itm.transform, poly_wgs84)
+            area_m2  = poly_itm.area
+            lo = min_m2 or 0
+            hi = max_m2 or float("inf")
+            if lo <= area_m2 <= hi:
+                base += 0.15   # in expected range → boost
+            elif area_m2 < lo * 0.5 or (max_m2 and area_m2 > hi * 2):
+                base -= 0.15   # very far out of range → penalise
+        except Exception:
+            pass
+
+    if not poly_wgs84.is_valid:
+        base -= 0.10
+
+    return round(max(0.0, min(1.0, base)), 2)
 
 
 # ─── Debug output ─────────────────────────────────────────────────────────────

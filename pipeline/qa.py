@@ -65,9 +65,11 @@ def run_qa(
     if not holes and _routing_meta_path.exists():
         try:
             _rm = json.loads(_routing_meta_path.read_text(encoding="utf-8"))
-            if _rm.get("source") == "routing_inference" and _rm.get("hole_count", 0) > 0:
+            # Accept both legacy "routing_inference" and new "vision + osm" sources
+            _valid_sources = {"routing_inference", "vision + osm"}
+            if _rm.get("source") in _valid_sources and _rm.get("hole_count", 0) > 0:
                 holes = [{"hole_number": i + 1} for i in range(_rm["hole_count"])]
-                log.debug(f"QA: supplemented {len(holes)} holes from routing_inference")
+                log.debug(f"QA: supplemented {len(holes)} holes from {_rm.get('source')}")
         except Exception:
             pass
 
@@ -145,22 +147,28 @@ def _check_routing_direction(holes: list, report: dict) -> None:
     """
     Check that no two holes have nearly identical routing (routing collision).
     Check that tee-to-green vectors are not all identical (sign of bad inference).
+    Gracefully skips holes where tee_centroid or green_centroid is missing.
     """
     issues = []
 
     bearings = []
     for hole in holes:
-        tee   = hole.get("tee_centroid", [0, 0])
-        green = hole.get("green_centroid", [0, 0])
-        b     = _bearing(tee, green)
-        bearings.append(b)
+        tee   = hole.get("tee_centroid")
+        green = hole.get("green_centroid")
+        if tee and green:
+            b = _bearing(tee, green)
+            bearings.append(b)
 
-    # Check for duplicate routings
+    # Check for duplicate routings — only for holes that have tee data
     for i, h1 in enumerate(holes):
         for j, h2 in enumerate(holes):
             if i >= j:
                 continue
-            d = _haversine(h1["tee_centroid"], h2["tee_centroid"])
+            tc1 = h1.get("tee_centroid")
+            tc2 = h2.get("tee_centroid")
+            if not tc1 or not tc2:
+                continue   # skip holes without tee data
+            d = _haversine(tc1, tc2)
             if d < 20:
                 issues.append(
                     f"Holes {h1['hole_number']} and {h2['hole_number']} "

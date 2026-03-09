@@ -82,6 +82,29 @@ COURSE_TYPE_PRESETS = {
     "inland":     {"rough": "Medium Rough", "green_speed": "Medium", "ground": "Soft"},
 }
 
+# ─── Vision detection area thresholds (real-world m²) ────────────────────────
+# Contours outside these ranges are discarded as false positives after projecting
+# from pixel space into metric coordinates.
+MIN_BUNKER_AREA_M2  = 40      # m² — minimum credible bunker
+MAX_BUNKER_AREA_M2  = 600     # m² — maximum credible bunker
+MIN_GREEN_AREA_M2   = 200     # m² — minimum putting green
+MAX_GREEN_AREA_M2   = 2500    # m² — maximum putting green
+MIN_FAIRWAY_AREA_M2 = 1000    # m² — minimum fairway strip
+
+# PGA 2K canvas in real-world metres (≈ 1372 yards × 0.9144)
+PGA_2K_CANVAS_M = 1255
+
+# ─── Tee detection ─────────────────────────────────────────────────────────────
+# Distance range from fairway start to search for tee boxes (metres)
+TEE_SEARCH_MIN_M = 5
+TEE_SEARCH_MAX_M = 80
+
+# ─── Optional ML vision refinement ────────────────────────────────────────────
+# Set True to enable ML-based segmentation refinement (pipeline/ml_vision.py).
+# Requires optional heavy dependencies (torch, torchvision, etc.).
+# When False the pipeline behaves exactly as without this flag.
+ENABLE_ML_VISION = False
+
 # ─── Output ───────────────────────────────────────────────────────────────────
 OUTPUT_DIR = "output"
 

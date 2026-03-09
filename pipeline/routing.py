@@ -73,10 +73,22 @@ def reconstruct_routing(
         log.warning("No green data — routing incomplete")
         holes = _route_from_tees_only(tees)
     else:
-        holes = _pair_tees_to_greens(tees, greens)
+        # Step 5: try skeleton-based routing first, fall back to pair matching
+        skeleton_holes = _skeleton_routing(osm_features_dir, greens)
+        if skeleton_holes and len(skeleton_holes) >= 9:
+            log.info(f"Routing skeleton generated — {len(skeleton_holes)} holes")
+            holes = skeleton_holes
+        else:
+            holes = _pair_tees_to_greens(tees, greens)
 
     # Add fairway corridors
     holes = _attach_fairway_corridors(holes, features_data, osm_features_dir)
+
+    # Step 9: Validate holes (remove impossible lengths)
+    holes_before = len(holes)
+    holes = _validate_holes(holes, osm_features_dir)
+    if len(holes) < holes_before:
+        log.info(f"Routing validation: {holes_before} → {len(holes)} holes retained")
 
     # Write output
     holes_path = output_dir / "holes.geojson"
@@ -86,9 +98,11 @@ def reconstruct_routing(
     # Write holes_metadata.json so QA can read the routing hole count
     meta_path = output_dir / "holes_metadata.json"
     meta_path.write_text(json.dumps({
-        "hole_count": len(holes),
-        "source":     "routing_inference",
+        "hole_count":     len(holes),
+        "routing_method": "inferred",
+        "source":         "vision + osm",
     }, indent=2), encoding="utf-8")
+    log.info(f"Routing: holes_metadata.json written ({len(holes)} holes, method=inferred)")
 
     return {
         "hole_count":  len(holes),
@@ -366,6 +380,226 @@ def _attach_fairway_corridors(
                 hole["fairway_corridor"] = None
 
     return holes
+
+
+# ─── Skeleton routing (Step 5) ────────────────────────────────────────────────
+
+def _skeleton_routing(
+    osm_dir: Optional[Path],
+    greens: List[dict],
+) -> List[dict]:
+    """
+    Attempt fairway skeleton-based routing.
+
+    Algorithm:
+      1. Load fairway polygons from OSM GeoJSON
+      2. Rasterize each fairway polygon into a binary image
+      3. Skeletonize to find the centreline
+      4. Find branch endpoints as candidate tee positions
+      5. Connect skeleton endpoints to the nearest unassigned green
+      6. Generate hole list ordered by skeleton path
+
+    Returns empty list on failure (caller falls back to pair matching).
+    """
+    if osm_dir is None:
+        return []
+
+    try:
+        from shapely.geometry import shape, LineString, Point, mapping
+        from shapely.ops import transform as shp_transform
+        from pyproj import Transformer
+        import numpy as np
+
+        fw_path = osm_dir / "fairways.geojson"
+        if not fw_path.exists():
+            return []
+
+        feats = _load_geojson_features(fw_path)
+        if not feats:
+            return []
+
+        try:
+            from skimage.morphology import skeletonize
+        except ImportError:
+            log.debug("scikit-image not available — skeleton routing skipped")
+            return []
+
+        t_to_itm = Transformer.from_crs("EPSG:4326", "EPSG:2157", always_xy=True)
+        t_to_wgs = Transformer.from_crs("EPSG:2157", "EPSG:4326", always_xy=True)
+
+        holes = []
+        assigned_greens = set()
+        hole_num = 1
+
+        for feat in feats:
+            if hole_num > MAX_HOLES:
+                break
+            if not feat.get("geometry"):
+                continue
+            try:
+                geom_wgs = shape(feat["geometry"])
+                geom_itm = shp_transform(t_to_itm.transform, geom_wgs)
+                bounds   = geom_itm.bounds
+                w = max(int(bounds[2] - bounds[0]), 1)
+                h = max(int(bounds[3] - bounds[1]), 1)
+
+                # Skip extremely large or tiny fairways
+                if w * h > 2_000_000 or w * h < 100:
+                    continue
+
+                # Build binary raster at 1m/px
+                res = 2  # 2m per pixel for speed
+                cols = max(w // res + 2, 4)
+                rows = max(h // res + 2, 4)
+                img  = np.zeros((rows, cols), dtype=np.uint8)
+
+                # Rasterize: fill pixels inside fairway polygon
+                from shapely.affinity import affine_transform
+                minx, miny = bounds[0], bounds[1]
+                scale = 1.0 / res
+                # Simple bounding-box rasterization
+                for r in range(rows):
+                    for c in range(cols):
+                        px = minx + c * res
+                        py = miny + r * res
+                        pt = Point(px, py)
+                        if geom_itm.contains(pt):
+                            img[r, c] = 1
+
+                skel = skeletonize(img)
+                skel_pts = list(zip(*np.where(skel)))
+                if len(skel_pts) < 3:
+                    continue
+
+                # Find endpoints (pixels with only 1 neighbour in skeleton)
+                endpoints = []
+                for (r, c) in skel_pts:
+                    neighbours = 0
+                    for dr in [-1, 0, 1]:
+                        for dc in [-1, 0, 1]:
+                            if (dr, dc) == (0, 0):
+                                continue
+                            nr, nc = r + dr, c + dc
+                            if 0 <= nr < rows and 0 <= nc < cols and skel[nr, nc]:
+                                neighbours += 1
+                    if neighbours == 1:
+                        # Convert back to ITM coords
+                        px = minx + c * res
+                        py = miny + r * res
+                        endpoints.append((px, py))
+
+                if not endpoints:
+                    continue
+
+                # Take the endpoint with minimum Y (south) as candidate tee
+                tee_itm = min(endpoints, key=lambda p: p[1])
+                tee_wgs = t_to_wgs.transform(tee_itm[0], tee_itm[1])
+
+                # Find nearest unassigned green
+                best_gi   = None
+                best_dist = float("inf")
+                for gi, g in enumerate(greens):
+                    if gi in assigned_greens:
+                        continue
+                    d = _haversine(tee_wgs[0], tee_wgs[1], g["lon"], g["lat"])
+                    if d < best_dist:
+                        best_dist = d
+                        best_gi   = gi
+
+                if best_gi is None or not (MIN_HOLE_LENGTH_M <= best_dist <= MAX_HOLE_LENGTH_M * 1.5):
+                    continue
+
+                assigned_greens.add(best_gi)
+                green = greens[best_gi]
+                par   = _estimate_par(best_dist)
+                holes.append({
+                    "hole_number":    hole_num,
+                    "tee_position":   {"lon": tee_wgs[0], "lat": tee_wgs[1]},
+                    "green_position": {"lon": green["lon"], "lat": green["lat"]},
+                    "distance_m":     round(best_dist, 1),
+                    "distance_yards": round(best_dist * 1.09361, 0),
+                    "par":            par,
+                    "routing_source": "skeleton",
+                })
+                hole_num += 1
+
+            except Exception as e:
+                log.debug(f"Skeleton routing failed for fairway: {e}")
+                continue
+
+        if holes:
+            holes.sort(key=lambda h: h["hole_number"])
+            log.info(f"Skeleton routing: {len(holes)} holes from {len(feats)} fairways")
+        return holes
+
+    except Exception as e:
+        log.debug(f"Skeleton routing aborted: {e}")
+        return []
+
+
+# ─── Routing validation (Step 9) ─────────────────────────────────────────────
+
+def _validate_holes(holes: List[dict], osm_dir: Optional[Path]) -> List[dict]:
+    """
+    Validate each hole and reject physically implausible ones.
+
+    Checks:
+      1. Hole length must be between 80m and 700m
+      2. Hole path should intersect a fairway (if OSM data available)
+      3. Hole must have a defined green position
+
+    Holes that fail hard checks are rejected.
+    Holes that fail soft checks get a warning flag but are kept.
+    """
+    from shapely.geometry import LineString, Point
+
+    # Load fairway geometries for intersection check
+    fairway_union = None
+    if osm_dir:
+        try:
+            fw_path = osm_dir / "fairways.geojson"
+            if fw_path.exists():
+                from shapely.geometry import shape
+                from shapely.ops import unary_union
+                feats = _load_geojson_features(fw_path)
+                fws = [shape(f["geometry"]) for f in feats if f.get("geometry")]
+                if fws:
+                    fairway_union = unary_union(fws)
+        except Exception:
+            pass
+
+    valid = []
+    for hole in holes:
+        tee   = hole.get("tee_position")
+        green = hole.get("green_position")
+
+        # Hard check: must have a green
+        if green is None:
+            log.debug(f"Hole {hole['hole_number']}: no green — rejected")
+            continue
+
+        # Hard check: distance must be plausible
+        dist = hole.get("distance_m")
+        if dist is not None and not (80 <= dist <= 700):
+            log.debug(f"Hole {hole['hole_number']}: distance {dist:.0f}m out of range — rejected")
+            continue
+
+        # Soft check: path should intersect a fairway
+        if fairway_union is not None and tee and green:
+            try:
+                line = LineString([
+                    (tee["lon"], tee["lat"]),
+                    (green["lon"], green["lat"]),
+                ])
+                if not fairway_union.intersects(line.buffer(0.0005)):
+                    hole["routing_warning"] = "path_no_fairway_intersection"
+                    log.debug(f"Hole {hole['hole_number']}: path does not intersect fairway (warning)")
+            except Exception:
+                pass
+
+        valid.append(hole)
+
+    return valid
 
 
 # ─── Fallback generators ──────────────────────────────────────────────────────

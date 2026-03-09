@@ -162,6 +162,64 @@ def serve_image(filename: str):
     return send_from_directory(str(COURSE_DIR), filename)
 
 
+@app.route("/api/geojson/<feature_type>")
+def api_geojson(feature_type: str):
+    """
+    Serve GeoJSON overlay layers for the Leaflet map.
+    Supports: holes, greens, bunkers, fairways, tees, water, rough
+    """
+    allowed = {"holes", "greens", "bunkers", "fairways", "tees", "water", "rough",
+               "features", "terrain_regions"}
+    if feature_type not in allowed:
+        abort(404)
+    path = COURSE_DIR / f"{feature_type}.geojson"
+    if not path.exists():
+        return '{"type":"FeatureCollection","features":[]}', 200, {
+            "Content-Type": "application/geo+json"
+        }
+    return path.read_text(encoding="utf-8"), 200, {
+        "Content-Type": "application/geo+json",
+        "Access-Control-Allow-Origin": "*",
+    }
+
+
+@app.route("/api/bounds")
+def api_bounds():
+    """Return course bounding box for Leaflet map initialisation."""
+    boundary_path = COURSE_DIR / "boundary.json"
+    if boundary_path.exists():
+        try:
+            b = json.loads(boundary_path.read_text(encoding="utf-8"))
+            bbox = b.get("bbox_wgs84")   # [min_lon, min_lat, max_lon, max_lat]
+            if bbox and len(bbox) == 4:
+                return jsonify({
+                    "bbox": bbox,
+                    "centre": b.get("centre_wgs84", [
+                        (bbox[0] + bbox[2]) / 2,
+                        (bbox[1] + bbox[3]) / 2,
+                    ]),
+                })
+        except Exception:
+            pass
+    # Fallback: compute centre from metadata holes
+    meta = _load_metadata()
+    holes = meta.get("holes", [])
+    lons, lats = [], []
+    for h in holes:
+        tc = h.get("tee_centroid")
+        gc = h.get("green_centroid")
+        for pt in [tc, gc]:
+            if pt and len(pt) == 2:
+                lons.append(pt[0])
+                lats.append(pt[1])
+    if lons:
+        return jsonify({
+            "bbox":   [min(lons), min(lats), max(lons), max(lats)],
+            "centre": [sum(lons) / len(lons), sum(lats) / len(lats)],
+        })
+    return jsonify({"bbox": None, "centre": [0, 0]})
+
+
 @app.route("/guide")
 def full_guide():
     """Serve the pre-generated full HTML guide if available."""

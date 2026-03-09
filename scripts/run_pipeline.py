@@ -269,6 +269,38 @@ Examples:
     except Exception as e:
         log.warning(f"  Vision extraction failed (non-critical): {e}")
 
+    # ── V3: Satellite-based tee detection (UPGRADE 5) ────────────────────────
+    log.info("\n[V3] Detecting tee boxes from satellite imagery...")
+    tees_path = output_dir / "tees.geojson"
+    if not tees_path.exists():
+        try:
+            from pipeline.tee_detection import detect_tees
+            mosaic_path = output_dir / "satellite_mosaic.jpg"
+            tee_result  = detect_tees(
+                bbox_wgs84=boundary_data["bbox_wgs84"],
+                output_dir=output_dir,
+                satellite_mosaic_path=mosaic_path if mosaic_path.exists() else None,
+            )
+            log.info(f"  Tees detected: {tee_result.get('tee_count', 0)}")
+        except Exception as e:
+            log.warning(f"  Tee detection failed (non-critical): {e}")
+    else:
+        log.info("  Using cached tees.geojson")
+
+    # ── V3: Optional ML vision refinement (UPGRADE 6) ────────────────────────
+    if config.ENABLE_ML_VISION:
+        log.info("\n[V3] Running ML vision refinement...")
+        try:
+            from pipeline.ml_vision import refine_vision_detections
+            ml_stats = refine_vision_detections(
+                output_dir=output_dir,
+                satellite_mosaic_path=output_dir / "satellite_mosaic.jpg",
+            )
+            if ml_stats:
+                log.info(f"  ML refinement stats: {ml_stats}")
+        except Exception as e:
+            log.warning(f"  ML vision refinement failed (non-critical): {e}")
+
     # ── V2: Course routing reconstruction (UPGRADE 4) ─────────────────────────
     log.info("\n[V2] Reconstructing course routing...")
     routing_data = {}
