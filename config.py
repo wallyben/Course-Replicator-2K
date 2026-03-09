@@ -98,3 +98,23 @@ COMPANION_PORT = 5000
 # ─── Coordinate reference systems ─────────────────────────────────────────────
 CRS_WGS84 = "EPSG:4326"
 CRS_ITM    = "EPSG:2157"   # Irish Transverse Mercator — used for all metric calculations
+
+# ─── Known courses ────────────────────────────────────────────────────────────
+# Hardcoded bounding boxes [min_lon, min_lat, max_lon, max_lat] for courses
+# that are missing or mis-tagged in OSM. These are used as an automatic fallback
+# when OSM resolution fails, so --bbox is not needed for these courses.
+# Add more as you discover OSM coverage gaps.
+KNOWN_COURSES = {
+    # Key: lowercase normalised name → [min_lon, min_lat, max_lon, max_lat]
+    "old conna golf club":      [-6.155, 53.182, -6.110, 53.208],
+    "old conna":                [-6.155, 53.182, -6.110, 53.208],
+    "powerscourt golf club":    [-6.207, 53.162, -6.160, 53.192],
+    "druids glen golf club":    [-6.101, 53.070, -6.057, 53.097],
+    "druids heath golf club":   [-6.108, 53.062, -6.063, 53.090],
+    "laytown and bettystown":   [-6.250, 53.694, -6.215, 53.718],
+    "the k club":               [-6.670, 53.305, -6.625, 53.330],
+    "mount juliet golf club":   [-7.220, 52.555, -7.175, 52.580],
+    "adare manor golf club":    [-8.820, 52.562, -8.775, 52.588],
+    "fota island golf club":    [-8.315, 51.893, -8.265, 51.918],
+    "carton house golf club":   [-6.588, 53.373, -6.543, 53.398],
+}

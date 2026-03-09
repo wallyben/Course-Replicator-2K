@@ -135,49 +135,68 @@ def resolve_boundary(course_name: str) -> dict:
     """
     Resolve a golf course name to boundary data.
 
+    Resolution strategy (in order):
+      1. Check KNOWN_COURSES lookup in config (instant, no network)
+      2. Try full name against OSM Overpass
+      3. Try progressively shortened name variants (drop "Golf Club", "Golf", etc.)
+      4. Try Ireland-wide area search with significant word only
+      5. Raise with helpful error including --bbox suggestion
+
     Returns:
         {
             "name": str,
-            "osm_id": int,
-            "osm_type": str,          # "way" or "relation"
-            "boundary_wgs84": dict,   # GeoJSON polygon
-            "bbox_wgs84": list,       # [min_lon, min_lat, max_lon, max_lat]
-            "bbox_buffered_itm": list, # [minx, miny, maxx, maxy] in EPSG:2157
-            "centre_wgs84": list,     # [lon, lat]
+            "osm_id": int or None,
+            "osm_type": str,
+            "boundary_wgs84": dict,
+            "bbox_wgs84": list,
+            "bbox_buffered_itm": list,
+            "centre_wgs84": list,
             "area_m2": float,
             "matched_name": str,
-            "confidence": str,        # HIGH / MEDIUM / LOW
+            "confidence": str,
         }
     """
     log.info(f"Resolving boundary for: {course_name!r}")
 
-    query = _overpass_query_by_name(course_name)
-    resp  = _overpass_request(query)
-    elements = resp.get("elements", [])
+    # ── Strategy 1: KNOWN_COURSES lookup ────────────────────────────────────
+    key = course_name.strip().lower()
+    if key in config.KNOWN_COURSES:
+        bbox = config.KNOWN_COURSES[key]
+        log.info(f"Found in KNOWN_COURSES — using hardcoded bbox: {bbox}")
+        return boundary_from_bbox(*bbox, course_name=course_name)
 
-    if not elements:
-        raise ValueError(
-            f"No OSM golf course found for: {course_name!r}. "
-            "Try the exact club name (e.g. 'Old Conna Golf Club') or check OSM coverage."
-        )
+    # ── Strategy 2–4: OSM Overpass with name variants ────────────────────────
+    name_variants = _build_name_variants(course_name)
+    elements      = []
 
-    # Find the best candidate: prefer relations, then ways
+    for variant in name_variants:
+        log.info(f"Trying OSM query: {variant!r}")
+        query = _overpass_query_by_name(variant)
+        resp  = _overpass_request(query)
+        elements = resp.get("elements", [])
+        candidates = [e for e in elements if e["type"] in ("relation", "way")]
+        if candidates:
+            log.info(f"Found {len(candidates)} candidate(s) with variant {variant!r}")
+            break
+        log.info(f"No results for variant {variant!r}")
+
+    if not elements or not [e for e in elements if e["type"] in ("relation", "way")]:
+        # Build a useful error with the known-courses hint
+        _raise_not_found(course_name)
+
+    # Find the best candidate
     candidates = [e for e in elements if e["type"] in ("relation", "way")]
-    if not candidates:
-        raise ValueError(f"OSM returned nodes only — no closed boundary found for {course_name!r}")
-
-    # Score candidates — prefer those whose name closely matches
     scored = []
     for el in candidates:
-        tags = el.get("tags", {})
+        tags    = el.get("tags", {})
         el_name = tags.get("name", "")
-        score = _name_similarity(course_name.lower(), el_name.lower())
+        score   = _name_similarity(course_name.lower(), el_name.lower())
         scored.append((score, el))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     best_score, best_el = scored[0]
 
-    confidence = "HIGH" if best_score > 0.7 else ("MEDIUM" if best_score > 0.4 else "LOW")
+    confidence   = "HIGH" if best_score > 0.7 else ("MEDIUM" if best_score > 0.4 else "LOW")
     matched_name = best_el.get("tags", {}).get("name", "Unknown")
 
     log.info(f"Best match: {matched_name!r} (score={best_score:.2f}, confidence={confidence})")
@@ -185,7 +204,6 @@ def resolve_boundary(course_name: str) -> dict:
     # Reconstruct geometry
     polygon = _ways_to_polygon(elements)
     if polygon is None:
-        # Try fetching the specific element in full
         osm_type = best_el["type"]
         osm_id   = best_el["id"]
         if osm_type == "relation":
@@ -197,35 +215,27 @@ def resolve_boundary(course_name: str) -> dict:
     if polygon is None:
         raise ValueError(
             f"Could not reconstruct boundary polygon for {matched_name!r}. "
-            "The OSM boundary may be incomplete. Try entering a manual bounding box."
+            "The OSM boundary may be incomplete. Use --bbox to specify manually."
         )
 
-    # Ensure we have a single polygon (take largest if multi)
     if polygon.geom_type == "MultiPolygon":
         polygon = max(polygon.geoms, key=lambda p: p.area)
 
-    # Compute in WGS84
-    centroid    = polygon.centroid
-    bbox_wgs84  = list(polygon.bounds)  # [minx, miny, maxx, maxy] = [w, s, e, n]
+    centroid   = polygon.centroid
+    bbox_wgs84 = list(polygon.bounds)
 
-    # Project to Irish Transverse Mercator for metric operations
     transformer_to_itm = Transformer.from_crs(config.CRS_WGS84, config.CRS_ITM, always_xy=True)
-    transformer_to_wgs = Transformer.from_crs(config.CRS_ITM, config.CRS_WGS84, always_xy=True)
-
     from shapely.ops import transform
     polygon_itm = transform(transformer_to_itm.transform, polygon)
 
-    # Buffered bounding box in ITM
     buf = config.BOUNDARY_BUFFER_M
-    itm_bounds = polygon_itm.bounds  # [minx, miny, maxx, maxy]
+    itm_bounds = polygon_itm.bounds
     bbox_buffered_itm = [
         itm_bounds[0] - buf,
         itm_bounds[1] - buf,
         itm_bounds[2] + buf,
         itm_bounds[3] + buf,
     ]
-
-    area_m2 = polygon_itm.area
 
     return {
         "name":                course_name,
@@ -236,7 +246,7 @@ def resolve_boundary(course_name: str) -> dict:
         "bbox_wgs84":          bbox_wgs84,
         "bbox_buffered_itm":   bbox_buffered_itm,
         "centre_wgs84":        [centroid.x, centroid.y],
-        "area_m2":             area_m2,
+        "area_m2":             polygon_itm.area,
         "confidence":          confidence,
     }
 
@@ -317,3 +327,54 @@ def _name_similarity(a: str, b: str) -> float:
         return 0.5
     intersection = tokens_a & tokens_b
     return len(intersection) / max(len(tokens_a), len(tokens_b))
+
+
+def _build_name_variants(course_name: str) -> list:
+    """
+    Build a list of progressively shorter name variants to try against OSM.
+
+    Example: "Old Conna Golf Club" →
+      ["Old Conna Golf Club", "Old Conna Golf", "Old Conna", "Conna"]
+    """
+    variants = [course_name]
+    suffixes_to_strip = [
+        " Golf Club", " Golf Links", " Golf Course", " Golf & Country Club",
+        " Golf", " Club", " Links", " Course",
+    ]
+    working = course_name
+    for suffix in suffixes_to_strip:
+        if working.lower().endswith(suffix.lower()):
+            working = working[: len(working) - len(suffix)].strip()
+            if working and working not in variants:
+                variants.append(working)
+
+    # Also try just the first significant word (for very specific searches)
+    stop = {"golf", "club", "course", "links", "the", "old", "new", "royal"}
+    words = [w for w in working.split() if w.lower() not in stop]
+    if words and len(words[-1]) > 3:
+        last_word = words[-1]
+        if last_word not in variants and last_word != working:
+            variants.append(last_word)
+
+    return variants
+
+
+def _raise_not_found(course_name: str) -> None:
+    """Raise a helpful ValueError when no OSM match is found."""
+    # Check if a nearby known course might help orient the user
+    known_hint = ""
+    key = course_name.strip().lower()
+    # Suggest adding to KNOWN_COURSES
+    known_hint = (
+        f"\n\nIf this course is not in OpenStreetMap, add it to KNOWN_COURSES in config.py:\n"
+        f'  "{key}": [min_lon, min_lat, max_lon, max_lat],\n'
+        f"Or use --bbox directly:\n"
+        f"  python scripts/run_pipeline.py \"{course_name}\" "
+        f"--bbox min_lon,min_lat,max_lon,max_lat\n"
+        f"(Find coordinates at openstreetmap.org — right-click → 'Show address')"
+    )
+    raise ValueError(
+        f"No OSM golf course found for: {course_name!r}\n"
+        f"Tried name variants but found nothing in OpenStreetMap."
+        + known_hint
+    )
