@@ -1,0 +1,652 @@
+/* ── Reset & base ──────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+    height: 100%;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 13px;
+    background: #0d1117;
+    color: #c9d1d9;
+    overflow: hidden;
+}
+
+/* ── Layout ────────────────────────────────────────────────────────────────── */
+#app {
+    display: flex;
+    height: 100vh;
+    width: 100vw;
+}
+
+#sidebar {
+    width: 300px;
+    min-width: 300px;
+    max-width: 300px;
+    background: #161b22;
+    border-right: 1px solid #30363d;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    z-index: 1000;
+}
+
+#map-container {
+    flex: 1;
+    position: relative;
+}
+
+#map {
+    width: 100%;
+    height: 100%;
+}
+
+/* ── Sidebar header ────────────────────────────────────────────────────────── */
+#sidebar-header {
+    padding: 14px 16px 10px;
+    border-bottom: 1px solid #30363d;
+    background: #0d1117;
+    flex-shrink: 0;
+}
+
+#sidebar-header h1 {
+    font-size: 14px;
+    font-weight: 700;
+    color: #f0f6fc;
+    letter-spacing: 0.3px;
+    margin-bottom: 2px;
+}
+
+#course-name {
+    font-size: 11px;
+    color: #8b949e;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+#course-area {
+    font-size: 10px;
+    color: #484f58;
+    margin-top: 1px;
+}
+
+/* ── Mode bar ──────────────────────────────────────────────────────────────── */
+#mode-bar {
+    display: flex;
+    gap: 4px;
+    padding: 10px 12px 8px;
+    border-bottom: 1px solid #30363d;
+    flex-shrink: 0;
+}
+
+#mode-bar button {
+    flex: 1;
+    padding: 6px 4px;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    background: #21262d;
+    color: #8b949e;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+#mode-bar button:hover {
+    background: #30363d;
+    color: #c9d1d9;
+}
+
+#mode-bar button.active {
+    background: #1f6feb;
+    border-color: #388bfd;
+    color: #fff;
+}
+
+#mode-bar button.active-edit {
+    background: #388329;
+    border-color: #46954a;
+    color: #fff;
+}
+
+#mode-bar button.active-delete {
+    background: #b62324;
+    border-color: #f85149;
+    color: #fff;
+}
+
+/* ── Layers panel ──────────────────────────────────────────────────────────── */
+#layers-panel {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 0;
+}
+
+#layers-panel::-webkit-scrollbar { width: 4px; }
+#layers-panel::-webkit-scrollbar-track { background: transparent; }
+#layers-panel::-webkit-scrollbar-thumb { background: #30363d; border-radius: 2px; }
+
+.layer-section {
+    padding: 0 12px 6px;
+}
+
+.layer-section-title {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.8px;
+    color: #484f58;
+    text-transform: uppercase;
+    padding: 8px 0 4px;
+}
+
+.layer-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 6px;
+    border-radius: 6px;
+    margin-bottom: 2px;
+    cursor: pointer;
+    transition: background 0.1s;
+    user-select: none;
+}
+
+.layer-row:hover {
+    background: #21262d;
+}
+
+.layer-row.active-draw {
+    background: #1c2f4a;
+    outline: 1px solid #1f6feb;
+}
+
+.layer-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    flex-shrink: 0;
+    border: 1px solid rgba(255,255,255,0.15);
+}
+
+.layer-label {
+    flex: 1;
+    font-size: 12px;
+    color: #c9d1d9;
+    font-weight: 500;
+}
+
+.layer-count {
+    font-size: 10px;
+    color: #484f58;
+    background: #21262d;
+    border-radius: 10px;
+    padding: 1px 6px;
+    min-width: 22px;
+    text-align: center;
+}
+
+.layer-count.has-features {
+    color: #58a6ff;
+    background: #1c2f4a;
+}
+
+.layer-vis-toggle {
+    width: 16px;
+    height: 16px;
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 12px;
+    color: #484f58;
+    padding: 0;
+    flex-shrink: 0;
+    opacity: 0.6;
+}
+
+.layer-vis-toggle.visible {
+    color: #8b949e;
+    opacity: 1;
+}
+
+/* ── Hole attributes panel ─────────────────────────────────────────────────── */
+#hole-attrs-panel {
+    padding: 10px 12px;
+    border-top: 1px solid #30363d;
+    border-bottom: 1px solid #30363d;
+    background: #0d1117;
+    flex-shrink: 0;
+    display: none;
+}
+
+#hole-attrs-panel.visible {
+    display: block;
+}
+
+#hole-attrs-panel h3 {
+    font-size: 11px;
+    font-weight: 600;
+    color: #f39c12;
+    margin-bottom: 8px;
+}
+
+.attrs-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+
+.attrs-field {
+    flex: 1;
+}
+
+.attrs-field label {
+    display: block;
+    font-size: 10px;
+    color: #8b949e;
+    margin-bottom: 3px;
+}
+
+.attrs-field input,
+.attrs-field select {
+    width: 100%;
+    padding: 5px 8px;
+    background: #21262d;
+    border: 1px solid #30363d;
+    border-radius: 5px;
+    color: #c9d1d9;
+    font-size: 12px;
+}
+
+.attrs-field input:focus,
+.attrs-field select:focus {
+    outline: none;
+    border-color: #1f6feb;
+}
+
+.attrs-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 6px;
+}
+
+.attrs-actions button {
+    flex: 1;
+    padding: 5px;
+    border-radius: 5px;
+    border: none;
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+#btn-hole-confirm {
+    background: #1f6feb;
+    color: #fff;
+}
+
+#btn-hole-confirm:hover { background: #388bfd; }
+
+#btn-hole-cancel {
+    background: #21262d;
+    color: #8b949e;
+    border: 1px solid #30363d;
+}
+
+#btn-hole-cancel:hover { background: #30363d; }
+
+/* ── Edit/Delete session bar ───────────────────────────────────────────────── */
+#session-bar {
+    padding: 8px 12px;
+    border-top: 1px solid #30363d;
+    background: #0d1117;
+    flex-shrink: 0;
+    display: none;
+    gap: 6px;
+}
+
+#session-bar.visible {
+    display: flex;
+}
+
+#session-bar span {
+    flex: 1;
+    font-size: 11px;
+    color: #8b949e;
+    align-self: center;
+}
+
+#btn-session-save {
+    padding: 5px 12px;
+    background: #238636;
+    color: #fff;
+    border: none;
+    border-radius: 5px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+}
+#btn-session-save:hover { background: #2ea043; }
+
+#btn-session-cancel {
+    padding: 5px 10px;
+    background: #21262d;
+    color: #8b949e;
+    border: 1px solid #30363d;
+    border-radius: 5px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+}
+#btn-session-cancel:hover { background: #30363d; }
+
+/* ── Import/Export footer ──────────────────────────────────────────────────── */
+#sidebar-footer {
+    padding: 10px 12px;
+    border-top: 1px solid #30363d;
+    background: #0d1117;
+    flex-shrink: 0;
+}
+
+#btn-load-detected {
+    width: 100%;
+    padding: 7px;
+    margin-bottom: 6px;
+    background: #21262d;
+    color: #8b949e;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+#btn-load-detected:hover {
+    background: #30363d;
+    color: #c9d1d9;
+}
+
+#btn-export {
+    width: 100%;
+    padding: 9px;
+    background: linear-gradient(135deg, #1f6feb, #1158d1);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+#btn-export:hover {
+    background: linear-gradient(135deg, #388bfd, #1f6feb);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(31, 111, 235, 0.4);
+}
+
+#btn-export:active {
+    transform: translateY(0);
+}
+
+#btn-export:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+}
+
+/* ── Status bar ────────────────────────────────────────────────────────────── */
+#status-bar {
+    padding: 6px 12px;
+    font-size: 10px;
+    color: #8b949e;
+    border-top: 1px solid #1c2128;
+    min-height: 24px;
+    transition: all 0.2s;
+}
+
+#status-bar.ok    { color: #3fb950; }
+#status-bar.error { color: #f85149; }
+#status-bar.info  { color: #58a6ff; }
+#status-bar.warn  { color: #d29922; }
+
+/* ── Map overlays ──────────────────────────────────────────────────────────── */
+#map-hint {
+    position: absolute;
+    top: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(13,17,23,0.85);
+    color: #c9d1d9;
+    padding: 6px 14px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 500;
+    pointer-events: none;
+    border: 1px solid #30363d;
+    backdrop-filter: blur(4px);
+    z-index: 500;
+    display: none;
+}
+
+#map-hint.visible { display: block; }
+
+/* ── Modal ─────────────────────────────────────────────────────────────────── */
+#modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.6);
+    z-index: 9000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    display: none;
+}
+
+#modal-overlay.visible { display: flex; }
+
+#modal-box {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 10px;
+    padding: 20px 24px;
+    width: 360px;
+    max-width: 90vw;
+}
+
+#modal-box h2 {
+    font-size: 14px;
+    font-weight: 700;
+    color: #f0f6fc;
+    margin-bottom: 14px;
+}
+
+.modal-field {
+    margin-bottom: 12px;
+}
+
+.modal-field label {
+    display: block;
+    font-size: 11px;
+    color: #8b949e;
+    margin-bottom: 4px;
+}
+
+.modal-field input,
+.modal-field select {
+    width: 100%;
+    padding: 8px 10px;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    color: #c9d1d9;
+    font-size: 13px;
+}
+
+.modal-field input:focus,
+.modal-field select:focus {
+    outline: none;
+    border-color: #1f6feb;
+}
+
+.modal-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 16px;
+    justify-content: flex-end;
+}
+
+.modal-actions button {
+    padding: 7px 16px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    border: none;
+}
+
+#modal-confirm {
+    background: #1f6feb;
+    color: #fff;
+}
+#modal-confirm:hover { background: #388bfd; }
+
+#modal-cancel {
+    background: #21262d;
+    color: #8b949e;
+    border: 1px solid #30363d;
+}
+#modal-cancel:hover { background: #30363d; }
+
+/* ── Export result ─────────────────────────────────────────────────────────── */
+#export-result {
+    margin-top: 8px;
+    padding: 8px 10px;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    font-size: 10px;
+    color: #8b949e;
+    display: none;
+}
+
+#export-result.visible {
+    display: block;
+}
+
+/* ── Import layer select dialog ────────────────────────────────────────────── */
+#import-checks {
+    margin-top: 6px;
+}
+
+.import-check-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+    font-size: 12px;
+}
+
+.import-check-row input[type=checkbox] {
+    width: 14px;
+    height: 14px;
+    cursor: pointer;
+    accent-color: #1f6feb;
+}
+
+/* ── Leaflet overrides ─────────────────────────────────────────────────────── */
+.leaflet-container {
+    background: #0d1117;
+}
+
+.leaflet-draw-toolbar a,
+.leaflet-draw-actions a {
+    background-color: #21262d !important;
+    color: #c9d1d9 !important;
+    border-color: #30363d !important;
+}
+
+.leaflet-draw-toolbar a:hover,
+.leaflet-draw-actions a:hover {
+    background-color: #30363d !important;
+}
+
+/* Hide default Leaflet.Draw toolbar — we use our own sidebar buttons */
+.leaflet-draw-toolbar { display: none !important; }
+
+/* Keep action bar visible (save/cancel during edit/delete) */
+.leaflet-draw-actions { display: block !important; }
+
+.leaflet-popup-content-wrapper {
+    background: #161b22;
+    color: #c9d1d9;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+}
+
+.leaflet-popup-tip { background: #161b22; }
+
+.popup-title {
+    font-weight: 700;
+    font-size: 12px;
+    color: #f0f6fc;
+    margin-bottom: 6px;
+}
+
+.popup-prop {
+    font-size: 11px;
+    color: #8b949e;
+    margin-bottom: 2px;
+}
+
+.popup-actions {
+    margin-top: 8px;
+    display: flex;
+    gap: 6px;
+}
+
+.popup-btn {
+    padding: 4px 10px;
+    border-radius: 5px;
+    border: none;
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.popup-btn-delete {
+    background: #b62324;
+    color: #fff;
+}
+.popup-btn-delete:hover { background: #f85149; }
+
+/* ── Satellite missing warning ─────────────────────────────────────────────── */
+#sat-missing-banner {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: rgba(22,27,34,0.9);
+    border: 1px solid #30363d;
+    border-radius: 10px;
+    padding: 20px 28px;
+    text-align: center;
+    z-index: 400;
+    display: none;
+    pointer-events: none;
+}
+
+#sat-missing-banner.visible { display: block; }
+
+#sat-missing-banner h3 {
+    font-size: 14px;
+    color: #d29922;
+    margin-bottom: 6px;
+}
+
+#sat-missing-banner p {
+    font-size: 11px;
+    color: #8b949e;
+}

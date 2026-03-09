@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Course Replicator 2K — Manual Digitizer</title>
+
+    <!-- Leaflet 1.9 -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <!-- Leaflet.Draw 1.0.4 -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+
+    <link rel="stylesheet" href="/static/digitizer.css">
+</head>
+<body>
+
+<div id="app">
+    <!-- ── Sidebar ──────────────────────────────────────────────────────── -->
+    <aside id="sidebar">
+
+        <div id="sidebar-header">
+            <h1>⛳ Course Replicator 2K</h1>
+            <div id="course-name">Loading…</div>
+            <div id="course-area"></div>
+        </div>
+
+        <!-- Mode buttons: Draw / Edit Vertices / Delete -->
+        <div id="mode-bar">
+            <button id="btn-mode-draw"   onclick="setMode('draw')"   title="Draw new features">✏ Draw</button>
+            <button id="btn-mode-edit"   onclick="setMode('edit')"   title="Edit vertex positions">⬡ Edit</button>
+            <button id="btn-mode-delete" onclick="setMode('delete')" title="Delete features">✕ Delete</button>
+        </div>
+
+        <!-- Layer list (built dynamically by JS) -->
+        <div id="layers-panel"></div>
+
+        <!-- Edit / Delete session save/cancel bar -->
+        <div id="session-bar">
+            <span id="session-label">Editing…</span>
+            <button id="btn-session-cancel" onclick="cancelSession()">Cancel</button>
+            <button id="btn-session-save"   onclick="saveSession()">Save</button>
+        </div>
+
+        <!-- Footer: import + export -->
+        <div id="sidebar-footer">
+            <button id="btn-load-detected" onclick="openImportModal()"
+                    title="Load auto-detected features from the pipeline as a starting point">
+                ↓ Load Auto-Detected
+            </button>
+            <button id="btn-export" onclick="exportToPipeline()">
+                ⬆ Export to Pipeline
+            </button>
+            <div id="export-result"></div>
+        </div>
+
+        <div id="status-bar">Ready</div>
+    </aside>
+
+    <!-- ── Map ──────────────────────────────────────────────────────────── -->
+    <div id="map-container">
+        <div id="map"></div>
+        <div id="map-hint"></div>
+        <div id="sat-missing-banner">
+            <h3>⚠ Satellite mosaic not found</h3>
+            <p>Run the pipeline to generate satellite_mosaic.jpg.<br>
+               Drawing on OSM tiles is still supported.</p>
+        </div>
+    </div>
+</div>
+
+<!-- ── Hole attribute modal ──────────────────────────────────────────────── -->
+<div id="modal-overlay">
+    <div id="modal-box">
+        <h2>🏌 Hole Route Properties</h2>
+
+        <div class="modal-field">
+            <label>Hole Number</label>
+            <input type="number" id="modal-hole-num" min="1" max="18" value="1">
+        </div>
+
+        <div class="modal-field">
+            <label>Par</label>
+            <select id="modal-par">
+                <option value="3">Par 3</option>
+                <option value="4" selected>Par 4</option>
+                <option value="5">Par 5</option>
+            </select>
+        </div>
+
+        <div class="modal-field">
+            <label>Hole Name / Notes (optional)</label>
+            <input type="text" id="modal-hole-name" placeholder="e.g. The Valley">
+        </div>
+
+        <div class="modal-actions">
+            <button id="modal-cancel" onclick="closeModal()">Cancel</button>
+            <button id="modal-confirm" onclick="confirmHoleModal()">Add Hole</button>
+        </div>
+    </div>
+</div>
+
+<!-- ── Import modal ───────────────────────────────────────────────────────── -->
+<div id="import-modal-overlay" style="
+    position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9001;
+    display:none;align-items:center;justify-content:center;">
+    <div id="import-modal-box" style="
+        background:#161b22;border:1px solid #30363d;border-radius:10px;
+        padding:20px 24px;width:320px;max-width:90vw;">
+        <h2 style="font-size:14px;font-weight:700;color:#f0f6fc;margin-bottom:12px;">
+            Import Auto-Detected Features
+        </h2>
+        <p style="font-size:11px;color:#8b949e;margin-bottom:12px;">
+            Select layers to import from the pipeline output.
+            Existing digitizer features for those layers will be replaced.
+        </p>
+        <div id="import-checks"></div>
+        <div style="display:flex;gap:8px;margin-top:16px;justify-content:flex-end;">
+            <button onclick="closeImportModal()" style="
+                padding:7px 14px;border-radius:6px;background:#21262d;
+                color:#8b949e;border:1px solid #30363d;font-size:12px;
+                font-weight:600;cursor:pointer;">Cancel</button>
+            <button onclick="confirmImport()" style="
+                padding:7px 16px;border-radius:6px;background:#1f6feb;
+                color:#fff;border:none;font-size:12px;
+                font-weight:600;cursor:pointer;">Import Selected</button>
+        </div>
+    </div>
+</div>
+
+<script src="/static/digitizer.js"></script>
+</body>
+</html>
