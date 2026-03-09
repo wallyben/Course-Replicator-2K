@@ -31,8 +31,9 @@ Verification:
 import json
 import logging
 import math
+import random
 import time
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import requests
 from shapely.geometry import shape, box, mapping
@@ -46,6 +47,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import config
 
 log = logging.getLogger(__name__)
+
+# ─── Overpass endpoint pool ───────────────────────────────────────────────────
+# Populated from config; shuffled randomly per request to distribute load and
+# work around per-endpoint rate limits (HTTP 429).
+_OVERPASS_ENDPOINTS: List[str] = getattr(
+    config, "OVERPASS_ENDPOINTS",
+    [config.OVERPASS_URL],
+)
 
 # ─── Area constraints ─────────────────────────────────────────────────────────
 _BBOX_AREA_MIN_M2   = 40  * 10_000   # 40 ha  — smallest real 18-hole course
@@ -64,85 +73,109 @@ _VERIFY_GREEN_MIN = 8    # fewer than this strongly suggests wrong course
 _VERIFY_GREEN_MAX = 35   # more than this is probably multiple courses
 
 
+# ─── Alias normalisation ─────────────────────────────────────────────────────
+
+def _apply_alias(course_name: str) -> str:
+    """
+    Look up course_name (lowercase) in config.COURSE_ALIASES.
+    Returns the canonical name if found, or the original name unchanged.
+    """
+    aliases = getattr(config, "COURSE_ALIASES", {})
+    return aliases.get(course_name.strip().lower(), course_name)
+
+
 # ─── Public API ───────────────────────────────────────────────────────────────
 
 def resolve_boundary(course_name: str) -> dict:
     """
     Resolve a golf course name to boundary data.
 
-    Cascade:
-      1. Nominatim geocode → (lat, lon)
-      2. Overpass polygon around geocoded point (500m, then 1500m)
-      3. KNOWN_COURSES bbox centre → same Overpass polygon query
-      4. Overpass name-search (legacy)
-      5. KNOWN_COURSES bbox directly
-      6. Raise ValueError
+    Full cascade (PARTS 1–6 of specification):
 
-    Returns boundary dict with keys:
-      name, matched_name, osm_id, osm_type, boundary_wgs84,
-      bbox_wgs84, bbox_buffered_itm, centre_wgs84, area_m2, confidence
+      0. Alias normalisation   — map colloquial names → canonical OSM name
+      1. Hard seed check       — KNOWN_COURSES tight bbox as coordinate seed;
+                                 immediately queries Overpass polygon around
+                                 that point (does NOT return bbox directly)
+      2. Nominatim geocode     — tries multiple name variants until one resolves
+      3. Overpass polygon      — around geocoded point, 500m then 1500m radius
+      4. Overpass name-search  — legacy string-match fallback
+      5. KNOWN_COURSES bbox    — raw rectangle (last resort, no network needed)
+      6. Raise ValueError      — with helpful --bbox hint
+
+    Endpoint rotation is applied to every Overpass request (_overpass_request).
     """
     log.info(f"Resolving boundary for: {course_name!r}")
 
-    # ── Step 1: Nominatim geocode ────────────────────────────────────────────
-    geocode_result = _nominatim_geocode(course_name)
-    if geocode_result:
-        lat, lon, nom_osm_id, nom_osm_type, nom_display = geocode_result
-        log.info(
-            f"Nominatim geocoded: {nom_display!r} → "
-            f"({lat:.5f}, {lon:.5f})"
-        )
-        # ── Step 2a: Overpass around geocoded point ──────────────────────────
-        poly_result = _overpass_polygon_around_point(lat, lon, _RADIUS_TIGHT_M)
-        if poly_result is None:
-            log.info(
-                f"No polygon within {_RADIUS_TIGHT_M}m — widening to {_RADIUS_WIDE_M}m"
-            )
-            poly_result = _overpass_polygon_around_point(lat, lon, _RADIUS_WIDE_M)
+    # ── Step 0: Course alias normalisation ───────────────────────────────────
+    canonical = _apply_alias(course_name)
+    if canonical != course_name:
+        log.info(f"Alias: {course_name!r} → {canonical!r}")
+    search_name = canonical   # used for Nominatim + Overpass searches
 
-        if poly_result:
-            polygon, matched_name, osm_id, osm_type = poly_result
-            return _build_boundary_dict(
-                polygon, course_name, matched_name, osm_id, osm_type,
-                confidence="HIGH",
-            )
-
-    # ── Step 3: KNOWN_COURSES bbox centre as geocode seed ────────────────────
-    key = course_name.strip().lower()
-    known_bbox = config.KNOWN_COURSES.get(key)
+    # ── Step 1: Hard seed from KNOWN_COURSES (tight coordinate seed) ─────────
+    # Look up by original name AND alias in case user typed either form.
+    known_bbox = (
+        config.KNOWN_COURSES.get(course_name.strip().lower())
+        or config.KNOWN_COURSES.get(canonical.strip().lower())
+    )
     if known_bbox:
         ctr_lon = (known_bbox[0] + known_bbox[2]) / 2.0
         ctr_lat = (known_bbox[1] + known_bbox[3]) / 2.0
         log.info(
-            f"KNOWN_COURSES seed for {key!r}: "
-            f"centre ({ctr_lat:.5f}, {ctr_lon:.5f}) — querying Overpass polygon"
+            f"KNOWN_COURSES hard seed: centre ({ctr_lat:.5f}, {ctr_lon:.5f}) "
+            f"— querying Overpass polygon (r={_RADIUS_TIGHT_M}m then {_RADIUS_WIDE_M}m)"
         )
         for radius in (_RADIUS_TIGHT_M, _RADIUS_WIDE_M):
-            poly_result = _overpass_polygon_around_point(ctr_lat, ctr_lon, radius)
+            try:
+                poly_result = _overpass_polygon_around_point(ctr_lat, ctr_lon, radius)
+            except RuntimeError as e:
+                log.warning(f"Overpass seed query failed (r={radius}m): {e}")
+                poly_result = None
             if poly_result:
                 polygon, matched_name, osm_id, osm_type = poly_result
                 log.info(
-                    f"KNOWN_COURSES seed resolved polygon: {matched_name!r} "
+                    f"Hard seed resolved polygon: {matched_name!r} "
                     f"at radius {radius}m"
                 )
                 return _build_boundary_dict(
                     polygon, course_name, matched_name, osm_id, osm_type,
                     confidence="HIGH",
                 )
-        # Polygon not found — fall back to bbox but log clearly
+        # Polygon not found via Overpass — fall back to raw bbox later,
+        # but first try Nominatim in case Overpass was rate-limited.
         log.warning(
-            f"KNOWN_COURSES Overpass polygon lookup failed — using raw bbox "
-            f"(course may be mis-tagged in OSM)"
+            f"KNOWN_COURSES Overpass polygon lookup failed — "
+            f"will try Nominatim before falling back to raw bbox"
         )
-        return boundary_from_bbox(*known_bbox, course_name=course_name)
 
-    # ── Step 4: Overpass name-search (legacy fallback) ───────────────────────
-    log.info("Nominatim unavailable and no KNOWN_COURSES entry — trying name search")
-    name_variants = _build_name_variants(course_name)
+    # ── Step 2: Nominatim geocode (with name variant expansion) ──────────────
+    geocode_result = _nominatim_geocode_with_variants(search_name)
+    if geocode_result:
+        lat, lon, _, _, nom_display = geocode_result
+        log.info(f"Nominatim resolved: {nom_display!r} → ({lat:.5f}, {lon:.5f})")
+
+        # ── Step 3: Overpass polygon around geocoded point ───────────────────
+        for radius in (_RADIUS_TIGHT_M, _RADIUS_WIDE_M):
+            try:
+                poly_result = _overpass_polygon_around_point(lat, lon, radius)
+            except RuntimeError as e:
+                log.warning(f"Overpass polygon query failed (r={radius}m): {e}")
+                poly_result = None
+            if poly_result:
+                polygon, matched_name, osm_id, osm_type = poly_result
+                return _build_boundary_dict(
+                    polygon, course_name, matched_name, osm_id, osm_type,
+                    confidence="HIGH",
+                )
+        log.warning("Nominatim point found but no Overpass polygon nearby")
+
+    # ── Step 4: Overpass name-search (legacy string-match) ───────────────────
+    log.info("Trying Overpass name-search fallback...")
+    name_variants = _build_name_variants(search_name)
     elements      = []
 
     for variant in name_variants:
-        log.info(f"Trying OSM name query: {variant!r}")
+        log.info(f"Overpass name query: {variant!r}")
         query = _overpass_query_by_name(variant)
         try:
             resp = _overpass_request(query)
@@ -154,16 +187,20 @@ def resolve_boundary(course_name: str) -> dict:
         if candidates:
             log.info(f"Found {len(candidates)} candidate(s) for {variant!r}")
             break
-        log.info(f"No results for variant {variant!r}")
+        log.info(f"No OSM results for {variant!r}")
 
     if elements and [e for e in elements if e["type"] in ("relation", "way")]:
         candidates = [e for e in elements if e["type"] in ("relation", "way")]
         scored = sorted(
-            [(  _name_similarity(course_name.lower(),
-                                 el.get("tags", {}).get("name", "").lower()),
-                el)
-             for el in candidates],
-            key=lambda x: x[0], reverse=True,
+            [(
+                _name_similarity(
+                    search_name.lower(),
+                    el.get("tags", {}).get("name", "").lower(),
+                ),
+                el,
+            ) for el in candidates],
+            key=lambda x: x[0],
+            reverse=True,
         )
         best_score, best_el = scored[0]
         confidence   = "HIGH" if best_score > 0.7 else ("MEDIUM" if best_score > 0.4 else "LOW")
@@ -174,11 +211,14 @@ def resolve_boundary(course_name: str) -> dict:
         if polygon is None:
             osm_type = best_el["type"]
             osm_id   = best_el["id"]
-            full_resp = _overpass_request(
-                _overpass_query_relation_full(osm_id) if osm_type == "relation"
-                else _overpass_query_way_full(osm_id)
-            )
-            polygon = _ways_to_polygon(full_resp.get("elements", []))
+            try:
+                full_resp = _overpass_request(
+                    _overpass_query_relation_full(osm_id) if osm_type == "relation"
+                    else _overpass_query_way_full(osm_id)
+                )
+                polygon = _ways_to_polygon(full_resp.get("elements", []))
+            except RuntimeError:
+                polygon = None
 
         if polygon is not None:
             return _build_boundary_dict(
@@ -186,11 +226,11 @@ def resolve_boundary(course_name: str) -> dict:
                 best_el["type"], confidence=confidence,
             )
 
-    # ── Step 5: KNOWN_COURSES raw bbox (last resort) ──────────────────────────
+    # ── Step 5: KNOWN_COURSES raw bbox (offline last resort) ─────────────────
     if known_bbox:
         log.warning(
-            f"All Overpass attempts failed — using KNOWN_COURSES raw bbox "
-            f"(accuracy LOW)"
+            "All network lookups failed — using KNOWN_COURSES raw bbox "
+            "(accuracy LOW; delete boundary.json and re-run when network is available)"
         )
         return boundary_from_bbox(*known_bbox, course_name=course_name)
 
@@ -310,6 +350,64 @@ def _nominatim_geocode(
     except (KeyError, ValueError, TypeError) as e:
         log.warning(f"Nominatim result parse error: {e}")
         return None
+
+
+# ─── Nominatim variant expansion ─────────────────────────────────────────────
+
+def _build_nominatim_variants(name: str) -> list:
+    """
+    Build a list of Nominatim query strings to try for a golf course name.
+
+    Variants (in order):
+      1. Original name as-is
+      2. "Golf Club"  → "Golf Course"  swap
+      3. "Golf Course"→ "Golf Club"    swap
+      4. "Golf Club"  → "Golf Links"   swap
+      5. Name + " Ireland"
+      6. Name + " Bray"
+    """
+    seen: list = []
+
+    def _add(v: str) -> None:
+        if v and v not in seen:
+            seen.append(v)
+
+    _add(name)
+
+    # Club ↔ Course / Links substitutions
+    for old, new in [
+        ("Golf Club",  "Golf Course"),
+        ("Golf Course","Golf Club"),
+        ("Golf Club",  "Golf Links"),
+    ]:
+        if old in name:
+            _add(name.replace(old, new, 1))
+
+    # Geographic qualifiers
+    for qualifier in [" Ireland", " Bray"]:
+        _add(name + qualifier)
+
+    return seen
+
+
+def _nominatim_geocode_with_variants(
+    name: str,
+) -> Optional[Tuple[float, float, Optional[int], Optional[str], str]]:
+    """
+    Try _nominatim_geocode() for each variant of name until one resolves.
+
+    Respects Nominatim's 1 req/s rate limit with a 1.1 s sleep between
+    unsuccessful attempts (successful first attempt returns immediately).
+    """
+    variants = _build_nominatim_variants(name)
+    for i, variant in enumerate(variants):
+        log.info(f"Nominatim geocode attempt {i+1}/{len(variants)}: {variant!r}")
+        result = _nominatim_geocode(variant)
+        if result:
+            return result
+        if i < len(variants) - 1:
+            time.sleep(1.1)   # 1 req/s Nominatim policy
+    return None
 
 
 # ─── Coordinate-based Overpass polygon query ─────────────────────────────────
@@ -793,29 +891,50 @@ out skel qt;
 # ─── Network ──────────────────────────────────────────────────────────────────
 
 def _overpass_request(query: str, retries: int = 3) -> dict:
-    """Send an Overpass QL query and return parsed JSON."""
-    for attempt in range(retries):
+    """
+    Send an Overpass QL query with endpoint rotation and 429 backoff.
+
+    Shuffles the endpoint pool on every call so load is distributed.
+    On HTTP 429 (rate-limit) or connection error the next endpoint in
+    the pool is tried after an exponential backoff (2s, 4s, 8s, …).
+    """
+    endpoints = list(_OVERPASS_ENDPOINTS)
+    random.shuffle(endpoints)
+    # Build a pool long enough to cover `retries` attempts,
+    # cycling through endpoints if retries > pool size.
+    pool = (endpoints * ((retries // max(len(endpoints), 1)) + 2))[:retries]
+
+    last_error: Exception = RuntimeError("No attempts made")
+    for attempt, endpoint in enumerate(pool):
         try:
             resp = requests.post(
-                config.OVERPASS_URL,
+                endpoint,
                 data={"data": query},
                 timeout=config.OVERPASS_TIMEOUT + 10,
             )
+            if resp.status_code == 429:
+                wait = 2 ** attempt
+                log.warning(
+                    f"Overpass 429 rate-limit at {endpoint} "
+                    f"(attempt {attempt+1}/{retries}) — waiting {wait}s then trying next endpoint"
+                )
+                time.sleep(wait)
+                last_error = requests.HTTPError(f"429 from {endpoint}", response=resp)
+                continue
             resp.raise_for_status()
             return resp.json()
         except requests.RequestException as e:
-            if attempt < retries - 1:
-                wait = 2 ** attempt
-                log.warning(
-                    f"Overpass request failed (attempt {attempt+1}): {e}. "
-                    f"Retrying in {wait}s..."
-                )
-                time.sleep(wait)
-            else:
-                raise RuntimeError(
-                    f"Overpass API unavailable after {retries} attempts: {e}"
-                ) from e
-    return {}
+            last_error = e
+            wait = 2 ** attempt
+            log.warning(
+                f"Overpass request failed (attempt {attempt+1}/{retries}, {endpoint}): {e}. "
+                f"Retrying in {wait}s..."
+            )
+            time.sleep(wait)
+
+    raise RuntimeError(
+        f"Overpass API unavailable after {retries} attempts: {last_error}"
+    ) from last_error
 
 
 # ─── String helpers ───────────────────────────────────────────────────────────

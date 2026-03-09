@@ -4,15 +4,39 @@ All tunable parameters live here. Edit this file before running the pipeline.
 """
 
 # ─── Overpass API ────────────────────────────────────────────────────────────
+# Primary endpoint retained for backward compatibility.
+# boundary.py rotates across OVERPASS_ENDPOINTS per request, falling back on
+# the next endpoint whenever a 429 or connection error is received.
 OVERPASS_URL     = "https://overpass-api.de/api/interpreter"
 OVERPASS_TIMEOUT = 120  # seconds
 
+# Endpoint rotation pool (shuffled randomly per request by boundary.py)
+OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.openstreetmap.ru/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+]
+
 # ─── Nominatim geocoder ───────────────────────────────────────────────────────
-# Nominatim is used as the primary geocoder in boundary.py to resolve course
-# names to precise (lat, lon) before the Overpass polygon lookup.
+# Used as the primary geocoder in boundary.py.
 # The public instance has a 1 req/s rate limit; always include a User-Agent.
 NOMINATIM_URL     = "https://nominatim.openstreetmap.org/search"
 NOMINATIM_TIMEOUT = 12   # seconds
+
+# ─── Course name aliases ──────────────────────────────────────────────────────
+# Maps common/colloquial input names → canonical name used for geocoding.
+# Keys must be lowercase; values are the name sent to Nominatim/Overpass.
+# Add entries here whenever a course is consistently mis-resolved.
+COURSE_ALIASES = {
+    "old conna golf club":   "Old Conna Golf Course",
+    "old conna":             "Old Conna Golf Course",
+    "old conna golf course": "Old Conna Golf Course",
+    "the k club":            "The K Club",
+    "k club":                "The K Club",
+    "mount juliet":          "Mount Juliet Golf Club",
+    "mount juliet golf":     "Mount Juliet Golf Club",
+}
 
 # ─── LiDAR sources ────────────────────────────────────────────────────────────
 # Irish National LiDAR Programme (Tailte Éireann) STAC endpoint
@@ -152,8 +176,12 @@ CRS_ITM    = "EPSG:2157"   # Irish Transverse Mercator — used for all metric c
 # Add more as you discover OSM coverage gaps.
 KNOWN_COURSES = {
     # Key: lowercase normalised name → [min_lon, min_lat, max_lon, max_lat]
-    "old conna golf club":      [-6.155, 53.182, -6.110, 53.208],
-    "old conna":                [-6.155, 53.182, -6.110, 53.208],
+    # Old Conna: tight bbox around the actual course (53.1950, -6.1325)
+    # Previous bbox [-6.155,53.182,-6.110,53.208] was 94.8 ha and overlapped
+    # Dun Laoghaire GC.  This tighter bbox is centred on the course entrance.
+    "old conna golf club":      [-6.138, 53.191, -6.125, 53.198],
+    "old conna golf course":    [-6.138, 53.191, -6.125, 53.198],
+    "old conna":                [-6.138, 53.191, -6.125, 53.198],
     "powerscourt golf club":    [-6.207, 53.162, -6.160, 53.192],
     "druids glen golf club":    [-6.101, 53.070, -6.057, 53.097],
     "druids heath golf club":   [-6.108, 53.062, -6.063, 53.090],

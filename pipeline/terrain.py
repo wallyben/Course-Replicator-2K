@@ -361,16 +361,18 @@ def _median_fill_nan(arr: np.ndarray, kernel: int = 5) -> np.ndarray:
     out = arr.copy()
     global_median = float(np.nanmedian(arr))
 
+    def _local_median(values: np.ndarray) -> float:
+        """Kernel function for generic_filter: returns local spatial median, NaN-safe."""
+        valid = values[~np.isnan(values)]
+        if len(valid) == 0:
+            return np.nan
+        return float(np.median(valid))
+
     # Up to 3 passes for NaN-surrounded cells
     for _ in range(3):
         if not np.any(np.isnan(out)):
             break
         nan_mask = np.isnan(out)
-
-        def _local_median(values):
-            valid = values[~np.isnan(values)]
-            return float(np.median(valid)) if len(valid) > 0 else np.nan
-
         filled = generic_filter(
             out, _local_median,
             size=kernel, mode="nearest"
