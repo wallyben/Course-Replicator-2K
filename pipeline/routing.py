@@ -58,10 +58,16 @@ def reconstruct_routing(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load tee and green positions from multiple sources
-    tees   = _load_tee_positions(features_data, osm_features_dir)
-    greens = _load_green_polygons(features_data, osm_features_dir)
+    tees_raw = _load_tee_positions(features_data, osm_features_dir)
+    greens   = _load_green_polygons(features_data, osm_features_dir)
 
-    log.info(f"Routing: {len(tees)} tees, {len(greens)} greens found")
+    # UPGRADE 1: Cluster multi-colour tee boxes (35m radius, keep backmost)
+    tees = _cluster_tees_proper(tees_raw, greens, cluster_radius_m=35)
+    log.info(
+        f"Routing: {len(tees_raw)} raw tees → {len(tees)} clusters, "
+        f"{len(greens)} greens found"
+    )
+    log.info(f"Tee clusters detected: {len(tees)}")
 
     if not tees and not greens:
         log.warning("No tee or green data available — cannot reconstruct routing")
@@ -73,13 +79,29 @@ def reconstruct_routing(
         log.warning("No green data — routing incomplete")
         holes = _route_from_tees_only(tees)
     else:
-        # Step 5: try skeleton-based routing first, fall back to pair matching
-        skeleton_holes = _skeleton_routing(osm_features_dir, greens)
-        if skeleton_holes and len(skeleton_holes) >= 9:
-            log.info(f"Routing skeleton generated — {len(skeleton_holes)} holes")
-            holes = skeleton_holes
-        else:
-            holes = _pair_tees_to_greens(tees, greens)
+        # UPGRADE 2: multi-segment fairway graph routing (primary)
+        holes = _multi_segment_routing(osm_features_dir, greens, tees)
+        if len(holes) < 9:
+            log.info(
+                f"Multi-segment routing yielded {len(holes)} holes — "
+                f"trying skeleton fallback"
+            )
+            # Skeleton fallback
+            skeleton_holes = _skeleton_routing(osm_features_dir, greens)
+            if skeleton_holes and len(skeleton_holes) >= 9:
+                log.info(f"Skeleton fallback: {len(skeleton_holes)} holes")
+                holes = skeleton_holes
+            else:
+                # Pair-matching final fallback
+                log.info(
+                    f"Pair-matching fallback from {len(tees)} tees, "
+                    f"{len(greens)} greens"
+                )
+                holes = _pair_tees_to_greens(tees, greens)
+
+    # UPGRADE 3: Order holes sequentially (each tee near previous green)
+    clubhouse = _find_clubhouse_pos(osm_features_dir)
+    holes = _order_holes_sequentially(holes, clubhouse)
 
     # Add fairway corridors
     holes = _attach_fairway_corridors(holes, features_data, osm_features_dir)
@@ -686,6 +708,354 @@ def _cluster_positions(positions: List[dict], cluster_radius_m: float) -> List[d
         if not is_dup:
             kept.append(pos)
     return kept
+
+
+def _cluster_tees_proper(
+    tees: List[dict],
+    greens: List[dict],
+    cluster_radius_m: float = 35.0,
+) -> List[dict]:
+    """
+    UPGRADE 1 — Cluster multi-colour tee boxes (white/yellow/blue/red) that
+    belong to the same hole.
+
+    Algorithm:
+      - Union-Find: group tees within cluster_radius_m of each other
+      - Within each cluster, keep the tee furthest from the green centroid
+        (backmost / championship tee)
+      - Attach tee_cluster_id and cluster_size metadata
+
+    Args:
+        tees:             Raw tee list from _load_tee_positions
+        greens:           Green list (used to compute green centroid reference)
+        cluster_radius_m: Radius to group same-hole tees (default 35m)
+
+    Returns:
+        Deduplicated tee list — one tee per cluster.
+    """
+    if not tees:
+        return []
+
+    # Green centroid as reference for "backmost" direction
+    if greens:
+        gc_lon = sum(g["lon"] for g in greens) / len(greens)
+        gc_lat = sum(g["lat"] for g in greens) / len(greens)
+    else:
+        gc_lon, gc_lat = tees[0]["lon"], tees[0]["lat"]
+
+    n = len(tees)
+    parent = list(range(n))
+
+    def _find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    # Build clusters
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = _haversine(tees[i]["lon"], tees[i]["lat"],
+                           tees[j]["lon"], tees[j]["lat"])
+            if d <= cluster_radius_m:
+                pi, pj = _find(i), _find(j)
+                if pi != pj:
+                    parent[pi] = pj
+
+    comps: Dict[int, List[int]] = {}
+    for i in range(n):
+        comps.setdefault(_find(i), []).append(i)
+
+    kept = []
+    for cid, members in enumerate(comps.values()):
+        # Back tee = furthest from green centroid
+        best_idx = max(
+            members,
+            key=lambda i: _haversine(tees[i]["lon"], tees[i]["lat"], gc_lon, gc_lat),
+        )
+        t = dict(tees[best_idx])
+        t["tee_cluster_id"] = cid + 1
+        t["cluster_size"]   = len(members)
+        kept.append(t)
+
+    return kept
+
+
+def _multi_segment_routing(
+    osm_dir: Optional[Path],
+    greens: List[dict],
+    tees: List[dict],
+) -> List[dict]:
+    """
+    UPGRADE 2 — Route holes using a fairway adjacency graph.
+
+    Algorithm:
+      1. Project all OSM fairway polygons to ITM (metres)
+      2. Build adjacency: fairways within 25m → connected edge
+      3. Union-Find connected components (each = one hole's fairway chain)
+      4. For each component:
+           a. Tee-end estimate: midpoint of southernmost boundary
+           b. Refine: use nearest known tee if within 150m
+           c. Pair to nearest unassigned green (component edge ≤150m away,
+              tee-to-green distance within hole length bounds)
+      5. Log "Fairway graph nodes/edges/Multi-segment routing holes"
+      6. Return hole list; fall back to [] on any unrecoverable error.
+    """
+    if osm_dir is None:
+        return []
+
+    try:
+        from shapely.geometry import shape, Point
+        from shapely.ops import transform as shp_transform, unary_union
+        from pyproj import Transformer
+
+        fw_path = osm_dir / "fairways.geojson"
+        if not fw_path.exists():
+            return []
+        feats = _load_geojson_features(fw_path)
+        if not feats:
+            return []
+
+        t_to_itm = Transformer.from_crs("EPSG:4326", "EPSG:2157", always_xy=True)
+        t_to_wgs = Transformer.from_crs("EPSG:2157", "EPSG:4326", always_xy=True)
+
+        # Project fairways to ITM
+        fw_itm: List = []
+        for feat in feats:
+            if not feat.get("geometry"):
+                continue
+            try:
+                g = shp_transform(t_to_itm.transform, shape(feat["geometry"]))
+                if g.is_valid and not g.is_empty:
+                    fw_itm.append(g)
+            except Exception:
+                pass
+
+        if not fw_itm:
+            return []
+
+        n = len(fw_itm)
+        log.info(f"Fairway graph nodes: {n}")
+
+        # Build adjacency at 25m threshold
+        ADJACENCY_M = 25.0
+        edges: List[Tuple[int, int]] = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                try:
+                    if fw_itm[i].distance(fw_itm[j]) <= ADJACENCY_M:
+                        edges.append((i, j))
+                except Exception:
+                    pass
+        log.info(f"Fairway graph edges: {len(edges)}")
+
+        # Union-Find
+        parent = list(range(n))
+
+        def _uf_find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for i, j in edges:
+            pi, pj = _uf_find(i), _uf_find(j)
+            if pi != pj:
+                parent[pi] = pj
+
+        comps: Dict[int, List[int]] = {}
+        for i in range(n):
+            comps.setdefault(_uf_find(i), []).append(i)
+
+        # Pre-project tees and greens to ITM for fast distance queries
+        tees_itm: List[Tuple[float, float, dict]] = []
+        for t in tees:
+            try:
+                tx, ty = t_to_itm.transform(t["lon"], t["lat"])
+                tees_itm.append((tx, ty, t))
+            except Exception:
+                pass
+
+        greens_itm: List[Optional[Tuple[float, float, dict]]] = []
+        for g in greens:
+            try:
+                gx, gy = t_to_itm.transform(g["lon"], g["lat"])
+                greens_itm.append((gx, gy, g))
+            except Exception:
+                greens_itm.append(None)
+
+        assigned_greens: set = set()
+        holes: List[dict] = []
+        hole_num = 1
+
+        for comp_indices in comps.values():
+            if hole_num > MAX_HOLES:
+                break
+
+            # Union fairways in this component
+            try:
+                comp_geom = unary_union([fw_itm[i] for i in comp_indices])
+            except Exception:
+                continue
+            if comp_geom.is_empty or comp_geom.area < 500:
+                continue
+
+            bounds = comp_geom.bounds  # (minx, miny, maxx, maxy)
+
+            # Tee-end estimate: midpoint of southernmost boundary
+            tee_est_x = (bounds[0] + bounds[2]) / 2.0
+            tee_est_y = bounds[1]
+            tee_pos_itm = (tee_est_x, tee_est_y)
+            tee_wgs_est = t_to_wgs.transform(tee_est_x, tee_est_y)
+
+            # Refine with nearest known tee if within 150m
+            best_tee_dist = float("inf")
+            tee_lon, tee_lat = float(tee_wgs_est[0]), float(tee_wgs_est[1])
+            for tx, ty, t in tees_itm:
+                d = math.sqrt((tx - tee_est_x) ** 2 + (ty - tee_est_y) ** 2)
+                if d < best_tee_dist:
+                    best_tee_dist = d
+                    if d < 150:
+                        tee_pos_itm = (tx, ty)
+                        tee_lon, tee_lat = t["lon"], t["lat"]
+
+            # Find nearest unassigned green with a valid hole distance
+            best_gi   = None
+            best_dist = float("inf")
+            for gi, gdata in enumerate(greens_itm):
+                if gi in assigned_greens or gdata is None:
+                    continue
+                gx, gy, g = gdata
+                try:
+                    # Green must be near the component boundary
+                    if comp_geom.distance(Point(gx, gy)) > 150:
+                        continue
+                    tx_u, ty_u = tee_pos_itm
+                    full_dist = math.sqrt((gx - tx_u) ** 2 + (gy - ty_u) ** 2)
+                    if (MIN_HOLE_LENGTH_M <= full_dist <= MAX_HOLE_LENGTH_M * 1.5
+                            and full_dist < best_dist):
+                        best_dist = full_dist
+                        best_gi   = gi
+                except Exception:
+                    pass
+
+            if best_gi is None:
+                continue
+
+            assigned_greens.add(best_gi)
+            _, _, green = greens_itm[best_gi]
+
+            holes.append({
+                "hole_number":      hole_num,
+                "tee_position":     {"lon": tee_lon, "lat": tee_lat},
+                "green_position":   {"lon": green["lon"], "lat": green["lat"]},
+                "distance_m":       round(best_dist, 1),
+                "distance_yards":   round(best_dist * 1.09361, 0),
+                "par":              _estimate_par(best_dist),
+                "routing_source":   "multi_segment",
+                "fairway_segments": len(comp_indices),
+            })
+            hole_num += 1
+
+        log.info(f"Multi-segment routing holes: {len(holes)}")
+        return holes
+
+    except Exception as e:
+        log.warning(f"Multi-segment routing failed: {e}")
+        return []
+
+
+def _order_holes_sequentially(
+    holes: List[dict],
+    clubhouse_pos: Optional[Tuple[float, float]] = None,
+) -> List[dict]:
+    """
+    UPGRADE 3 — Re-order holes so each hole's tee is nearest to the
+    previous hole's green.
+
+    Start-hole selection (in priority order):
+      1. Hole whose tee is nearest to clubhouse_pos (if provided)
+      2. Northernmost tee (latitude proxy for traditional first tee)
+
+    Holes without tee+green positions are appended at the end unchanged.
+    All holes are renumbered 1–N.
+    """
+    positioned   = [h for h in holes
+                    if h.get("tee_position") and h.get("green_position")]
+    unpositioned = [h for h in holes
+                    if not (h.get("tee_position") and h.get("green_position"))]
+
+    if len(positioned) <= 1:
+        for i, h in enumerate(holes):
+            h["hole_number"] = i + 1
+        return holes
+
+    if clubhouse_pos:
+        ch_lon, ch_lat = clubhouse_pos
+        start_idx = min(
+            range(len(positioned)),
+            key=lambda i: _haversine(
+                ch_lon, ch_lat,
+                positioned[i]["tee_position"]["lon"],
+                positioned[i]["tee_position"]["lat"],
+            ),
+        )
+    else:
+        # Northernmost tee as first-hole proxy
+        start_idx = max(
+            range(len(positioned)),
+            key=lambda i: positioned[i]["tee_position"]["lat"],
+        )
+
+    ordered: List[dict] = [positioned[start_idx]]
+    remaining = [h for i, h in enumerate(positioned) if i != start_idx]
+
+    while remaining:
+        prev_green = ordered[-1]["green_position"]
+        best_i = min(
+            range(len(remaining)),
+            key=lambda i: _haversine(
+                prev_green["lon"], prev_green["lat"],
+                remaining[i]["tee_position"]["lon"],
+                remaining[i]["tee_position"]["lat"],
+            ),
+        )
+        ordered.append(remaining[best_i])
+        remaining.pop(best_i)
+
+    all_ordered = ordered + unpositioned
+    for i, h in enumerate(all_ordered):
+        h["hole_number"] = i + 1
+
+    return all_ordered
+
+
+def _find_clubhouse_pos(
+    osm_dir: Optional[Path],
+) -> Optional[Tuple[float, float]]:
+    """
+    Try to find the clubhouse location from OSM GeoJSON files.
+    Returns (lon, lat) or None.
+    """
+    if osm_dir is None:
+        return None
+    for fname in ("features.geojson", "paths.geojson"):
+        fpath = osm_dir / fname
+        if not fpath.exists():
+            continue
+        try:
+            for f in _load_geojson_features(fpath):
+                props = f.get("properties", {})
+                if (props.get("amenity") == "club_house"
+                        or props.get("golf") == "clubhouse"):
+                    geom = f.get("geometry", {})
+                    if geom.get("type") == "Point":
+                        c = geom.get("coordinates", [])
+                        if len(c) >= 2:
+                            return (float(c[0]), float(c[1]))
+        except Exception:
+            pass
+    return None
 
 
 def _haversine(lon1: float, lat1: float, lon2: float, lat2: float) -> float:

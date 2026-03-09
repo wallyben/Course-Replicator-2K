@@ -424,6 +424,26 @@ Examples:
                 "holes_path":  str(routing_path),
             }
             log.info(f"  Cached routing: {len(_cached_holes)} holes loaded")
+
+            # CRITICAL BUG FIX: holes_metadata.json may be missing or 0KB on
+            # cached runs (routing.py was not called → file never written).
+            # Regenerate it from the cached hole list so QA + translation have
+            # a valid metadata file regardless of whether routing re-ran.
+            _meta_path = output_dir / "holes_metadata.json"
+            if not _is_valid_cache(_meta_path):
+                _meta_payload = json.dumps({
+                    "hole_count":        len(_cached_holes),
+                    "routing_method":    "inferred",
+                    "source":            "vision + osm",
+                    "has_inferred_tees": True,
+                    "cached":            True,
+                }, indent=2)
+                _meta_path.write_text(_meta_payload, encoding="utf-8")
+                log.info(
+                    f"  Routing cache: holes_metadata.json regenerated — "
+                    f"{len(_cached_holes)} holes, {_meta_path.stat().st_size} bytes"
+                )
+
         except Exception as e:
             log.warning(f"  Cached routing read failed ({e}) — re-running routing")
             routing_data = {}
