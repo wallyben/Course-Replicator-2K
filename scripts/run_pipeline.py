@@ -178,6 +178,15 @@ Examples:
         action="store_true",
         help="Enable debug logging",
     )
+    parser.add_argument(
+        "--force-redetect",
+        action="store_true",
+        help=(
+            "Re-run vision/OSM feature extraction even if manual digitizer "
+            "features have been exported (digitizer_export_manifest.json). "
+            "WARNING: this overwrites manually digitized GeoJSON files."
+        ),
+    )
     args = parser.parse_args()
 
     if args.verbose:
@@ -336,34 +345,70 @@ Examples:
             log.exception(e)
             sys.exit(1)
 
-    # ── V2: OSM per-type feature extraction (UPGRADE 2) ─────────────────────
-    log.info("\n[V2] Extracting per-type OSM golf features...")
-    osm_summary = {}
-    try:
-        from pipeline.osm_features import extract_osm_features
-        osm_summary = extract_osm_features(boundary_data, output_dir)
-        log.info(f"  OSM features: {osm_summary.get('counts', {})}")
-    except Exception as e:
-        log.warning(f"  OSM feature extraction failed (non-critical): {e}")
+    # ── Digitizer manifest guard ─────────────────────────────────────────────
+    # If the user has exported manually digitized features, skip OSM/vision
+    # extraction so those files are not overwritten.  Pass --force-redetect
+    # to override and re-run the full auto-detection pipeline.
+    _digitizer_manifest = output_dir / "digitizer_export_manifest.json"
+    _use_manual_features = _digitizer_manifest.exists() and not args.force_redetect
+
+    if _use_manual_features:
+        _dman = json.loads(_digitizer_manifest.read_text(encoding="utf-8"))
+        _dman_counts = _dman.get("exported_layers", {})
+        _dman_total  = _dman.get("total_features", 0)
+        log.info(
+            f"\n[V2] ✓ Manual digitizer features detected "
+            f"({_dman_total} features across "
+            f"{len([v for v in _dman_counts.values() if v > 0])} layers)."
+        )
+        log.info("  Skipping OSM + vision extraction to preserve manual features.")
+        log.info("  Run with --force-redetect to override.")
+        osm_summary    = {}
+        vision_summary = {}
+        # Load cached vision_summary if available (needed for routing context)
+        _vis_path = output_dir / "vision_summary.json"
+        if _vis_path.exists():
+            try:
+                vision_summary = json.loads(_vis_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+    else:
+        if args.force_redetect and _digitizer_manifest.exists():
+            log.warning(
+                "\n[V2] --force-redetect: overwriting manually digitized features!"
+            )
+
+        # ── V2: OSM per-type feature extraction (UPGRADE 2) ─────────────────
+        log.info("\n[V2] Extracting per-type OSM golf features...")
+        osm_summary = {}
+        try:
+            from pipeline.osm_features import extract_osm_features
+            osm_summary = extract_osm_features(boundary_data, output_dir)
+            log.info(f"  OSM features: {osm_summary.get('counts', {})}")
+        except Exception as e:
+            log.warning(f"  OSM feature extraction failed (non-critical): {e}")
 
     # ── V2: Satellite vision feature detection (UPGRADE 3) ───────────────────
-    log.info("\n[V2] Running satellite vision feature detection...")
-    vision_summary = {}
-    try:
-        from pipeline.vision_extract import (
-            detect_features,
-            merge_vision_with_osm,
-            refilter_water_strict,
-        )
-        vision_summary = detect_features(
-            boundary_data["bbox_wgs84"],
-            output_dir,
-            zoom=16,
-            boundary_data=boundary_data,   # UPGRADE 1: course boundary mask
-        )
-        if vision_summary.get("detections"):
-            merge_stats = merge_vision_with_osm(vision_summary, output_dir)
-            log.info(f"  Vision detections merged: {merge_stats}")
+    if not _use_manual_features:
+        log.info("\n[V2] Running satellite vision feature detection...")
+        vision_summary = {}
+        try:
+            from pipeline.vision_extract import (
+                detect_features,
+                merge_vision_with_osm,
+                refilter_water_strict,
+            )
+            vision_summary = detect_features(
+                boundary_data["bbox_wgs84"],
+                output_dir,
+                zoom=16,
+                boundary_data=boundary_data,   # UPGRADE 1: course boundary mask
+            )
+            if vision_summary.get("detections"):
+                merge_stats = merge_vision_with_osm(vision_summary, output_dir)
+                log.info(f"  Vision detections merged: {merge_stats}")
+        except Exception as e:
+            log.warning(f"  Vision extraction failed (non-critical): {e}")
 
         # ── Multi-stage validation pass ──────────────────────────────────────
         # If water is severely over-detected (>25 bodies) apply a strict
@@ -432,8 +477,6 @@ Examples:
                 )
         except Exception as bve:
             log.debug(f"Boundary verification failed (non-critical): {bve}")
-    except Exception as e:
-        log.warning(f"  Vision extraction failed (non-critical): {e}")
 
     # ── V3: Satellite-based tee detection (UPGRADE 5) ────────────────────────
     log.info("\n[V3] Detecting tee boxes from satellite imagery...")
@@ -445,7 +488,9 @@ Examples:
         _is_valid_cache(tees_path) and
         _geojson_has_features(tees_path)
     )
-    if not getattr(config, "ENABLE_TEE_DETECTION", True):
+    if _use_manual_features and _tees_valid_cache:
+        log.info("  Tee detection skipped — using manually digitized tees.geojson.")
+    elif not getattr(config, "ENABLE_TEE_DETECTION", True):
         log.info("  Tee detection disabled via config.")
     elif _tees_valid_cache:
         log.info(f"  Using cached tees.geojson ({tees_path.stat().st_size} bytes)")
@@ -708,6 +753,14 @@ Examples:
         if f.is_file():
             size_kb = f.stat().st_size / 1024
             log.info(f"    {f.relative_to(output_dir)} ({size_kb:.0f}KB)")
+    log.info(f"")
+    if _use_manual_features:
+        log.info(f"  ✓ Manual digitizer features were used (preserved).")
+        log.info(f"    To re-detect: re-run with --force-redetect")
+    else:
+        log.info(f"  Tip — refine features with the manual digitizer:")
+        log.info(f"    python pipeline/manual_digitizer/server.py --course {output_dir}")
+        log.info(f"    Open  http://localhost:{getattr(config,'DIGITIZER_PORT',5050)}")
     log.info(f"")
     log.info(f"  Next step — start the companion app:")
     log.info(f"    python companion/app.py --course {output_dir}")
