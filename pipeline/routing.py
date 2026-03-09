@@ -95,14 +95,26 @@ def reconstruct_routing(
     _write_holes_geojson(holes, holes_path)
     log.info(f"Routing: {len(holes)} holes written to {holes_path.name}")
 
-    # Write holes_metadata.json so QA can read the routing hole count
-    meta_path = output_dir / "holes_metadata.json"
-    meta_path.write_text(json.dumps({
-        "hole_count":     len(holes),
-        "routing_method": "inferred",
-        "source":         "vision + osm",
-    }, indent=2), encoding="utf-8")
-    log.info(f"Routing: holes_metadata.json written ({len(holes)} holes, method=inferred)")
+    # Write holes_metadata.json — authoritative routing summary.
+    # NOTE: features.py writes osm_holes_metadata.json (list format) so there
+    # is no filename collision.  This dict format is what QA and translation read.
+    meta_path    = output_dir / "holes_metadata.json"
+    meta_payload = json.dumps({
+        "hole_count":       len(holes),
+        "routing_method":   "inferred",
+        "source":           "vision + osm",
+        "has_inferred_tees": all(
+            h.get("routing_source") in ("greens_only", "reconstructed",
+                                        "skeleton", "placeholder")
+            for h in holes
+        ),
+    }, indent=2)
+    meta_path.write_text(meta_payload, encoding="utf-8")
+    n_bytes = meta_path.stat().st_size
+    log.info(
+        f"Routing: holes_metadata.json written — {len(holes)} holes, "
+        f"{n_bytes} bytes, path={meta_path}"
+    )
 
     return {
         "hole_count":  len(holes),

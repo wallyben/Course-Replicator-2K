@@ -162,9 +162,10 @@ def extract_features(boundary_data: dict, output_dir: Path) -> dict:
     geojson_path = output_dir / "features.geojson"
     geojson_path.write_text(json.dumps(geojson, indent=2), encoding="utf-8")
 
-    # Write holes metadata
-    holes_path = output_dir / "holes_metadata.json"
-    holes_path.write_text(json.dumps(holes, indent=2), encoding="utf-8")
+    # Write holes metadata — use a distinct file name so routing.py's
+    # holes_metadata.json (dict format) is never overwritten by this list.
+    osm_holes_path = output_dir / "osm_holes_metadata.json"
+    osm_holes_path.write_text(json.dumps(holes, indent=2), encoding="utf-8")
 
     # Render feature map
     feature_map_path = output_dir / "feature_map.png"
@@ -178,7 +179,7 @@ def extract_features(boundary_data: dict, output_dir: Path) -> dict:
 
     result = {
         "features_geojson":  str(geojson_path),
-        "holes_metadata":    str(holes_path),
+        "holes_metadata":    str(osm_holes_path),
         "feature_map_path":  str(feature_map_path),
         "holes":             holes,
         "hole_count":        len(holes),

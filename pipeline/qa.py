@@ -40,6 +40,7 @@ def run_qa(
     build_pack:     dict,
     output_dir:     Path,
     expected_scorecard: Optional[List[dict]] = None,
+    routing_data:   Optional[dict] = None,
 ) -> dict:
     """
     Run all QA checks and produce a report.
@@ -95,13 +96,13 @@ def run_qa(
     _check_elevation(terrain_stats, report)
 
     # ── Check 5: Hazard presence ────────────────────────────────────────────
-    _check_hazards(holes, features_data, report)
+    _check_hazards(holes, features_data, report, output_dir)
 
     # ── Check 6: Feature confidence ─────────────────────────────────────────
     _check_confidence(features_data, report)
 
     # ── Check 7: Canvas fit ─────────────────────────────────────────────────
-    _check_canvas_fit(build_pack, report)
+    _check_canvas_fit(build_pack, report, routing_data)
 
     # ── Check 8: Course feel ────────────────────────────────────────────────
     _check_course_feel(terrain_stats, features_data, report)
@@ -258,28 +259,55 @@ def _check_elevation(terrain_stats: dict, report: dict) -> None:
     })
 
 
-def _check_hazards(holes: list, features_data: dict, report: dict) -> None:
-    """Check bunker and water hazard presence and plausibility."""
-    total_bunkers = sum(len(h.get("bunkers", [])) for h in holes)
-    cs            = features_data.get("confidence_summary", {})
-    bunk_conf     = cs.get("bunker", {}).get("label", "LOW")
+def _check_hazards(holes: list, features_data: dict, report: dict,
+                   output_dir: Optional[Path] = None) -> None:
+    """Check bunker and water hazard presence and plausibility.
+
+    Counts bunkers from (in priority order):
+      1. bunkers.geojson  — merged OSM + vision output (most accurate)
+      2. hole-attached bunker lists in features_data["holes"]
+    """
+    # Primary: count from merged geojson file
+    total_bunkers = 0
+    geojson_source = False
+    if output_dir is not None:
+        bunkers_path = Path(output_dir) / "bunkers.geojson"
+        if bunkers_path.exists():
+            try:
+                data = json.loads(bunkers_path.read_text(encoding="utf-8"))
+                feats = data.get("features", []) if isinstance(data, dict) else []
+                total_bunkers = len(feats)
+                geojson_source = True
+                log.debug(f"QA: counted {total_bunkers} bunkers from bunkers.geojson")
+            except Exception as exc:
+                log.warning(f"QA: failed to read bunkers.geojson — {exc}")
+
+    # Fallback: sum from hole-attached lists
+    if not geojson_source:
+        total_bunkers = sum(len(h.get("bunkers", [])) for h in holes)
+        log.debug(f"QA: counted {total_bunkers} bunkers from hole-attached lists (fallback)")
+
+    cs        = features_data.get("confidence_summary", {})
+    bunk_conf = cs.get("bunker", {}).get("label", "LOW")
+    source_note = " (from merged GeoJSON)" if geojson_source else " (from OSM hole data)"
 
     if total_bunkers == 0:
         status = "WARN"
-        msg    = "No bunkers detected in OSM. All bunker placement will be manual."
+        msg    = "No bunkers detected. All bunker placement will be manual."
     elif total_bunkers < 18:
         status = "WARN"
         msg    = (
-            f"{total_bunkers} bunkers detected (typical 18-hole course: 50–100). "
-            "OSM bunker coverage may be incomplete."
+            f"{total_bunkers} bunkers detected{source_note} "
+            f"(typical 18-hole course: 50–100). Coverage may be incomplete."
         )
     else:
         status = "PASS"
-        msg    = f"{total_bunkers} bunkers detected. Confidence: {bunk_conf}."
+        msg    = f"{total_bunkers} bunkers detected{source_note}. Confidence: {bunk_conf}."
 
     _add_check(report, "Hazard Presence", status, msg, {
-        "total_bunkers":   total_bunkers,
+        "total_bunkers":     total_bunkers,
         "bunker_confidence": bunk_conf,
+        "source":            "geojson" if geojson_source else "hole_lists",
     })
 
 
@@ -301,9 +329,23 @@ def _check_confidence(features_data: dict, report: dict) -> None:
         )
 
 
-def _check_canvas_fit(build_pack: dict, report: dict) -> None:
+def _check_canvas_fit(build_pack: dict, report: dict,
+                      routing_data: Optional[dict] = None) -> None:
     """Check whether the course fits within 2K canvas limits."""
     total_yards = build_pack.get("total_yards", 0)
+
+    # Fallback: derive total yards from routing holes when build_pack is incomplete
+    if not total_yards and routing_data:
+        r_holes = routing_data.get("holes", [])
+        yd_sum  = sum(
+            (h.get("distance_yards") or h.get("length_yards") or
+             (h.get("distance_m") or h.get("length_m") or 0) * 1.09361)
+            for h in r_holes
+        )
+        if yd_sum > 0:
+            total_yards = round(yd_sum)
+            log.debug(f"QA canvas check: derived {total_yards}y from routing_data fallback")
+
     if not total_yards:
         _add_check(report, "Canvas Fit", "WARN", "Total yards unknown — canvas fit unverifiable.", {})
         return

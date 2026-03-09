@@ -53,6 +53,84 @@ def slugify(name: str) -> str:
     return slug.strip("-")[:60]
 
 
+# ─── Cache validation helpers ─────────────────────────────────────────────────
+
+_MIN_CACHE_BYTES = getattr(config, "INVALID_CACHE_MIN_BYTES", 10)
+
+
+def _is_valid_cache(path: Path) -> bool:
+    """
+    Return True if the file exists and is large enough to be non-empty content.
+    Does NOT parse the file — use _geojson_has_features for deeper checks.
+    """
+    if not path.exists():
+        return False
+    try:
+        return path.stat().st_size >= _MIN_CACHE_BYTES
+    except OSError:
+        return False
+
+
+def _geojson_has_features(path: Path) -> bool:
+    """
+    Return True if path is a valid GeoJSON FeatureCollection with ≥1 feature.
+    Returns False if file is missing, empty, malformed, or has zero features.
+    """
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return (
+            isinstance(data, dict) and
+            data.get("type") == "FeatureCollection" and
+            len(data.get("features", [])) > 0
+        )
+    except Exception:
+        return False
+
+
+def _normalise_routing_holes(routing_holes: list) -> list:
+    """
+    Convert routing.py hole dicts to the feature.py hole dict format that
+    translation.py / qa.py / companion UI expect.
+
+    Routing format:   tee_position, green_position, distance_m, distance_yards
+    Features format:  tee_centroid, green_centroid, length_m, length_yards
+    """
+    normalised = []
+    for h in routing_holes:
+        tee_pos   = h.get("tee_position")   or {}
+        grn_pos   = h.get("green_position") or {}
+        tee_lon   = tee_pos.get("lon")
+        tee_lat   = tee_pos.get("lat")
+        grn_lon   = grn_pos.get("lon")
+        grn_lat   = grn_pos.get("lat")
+
+        # distance_m / distance_yards are the routing field names
+        dist_m  = h.get("distance_m")    or h.get("length_m")
+        dist_yd = h.get("distance_yards") or h.get("length_yards")
+
+        # If yards were stored but metres missing (or vice versa), compute
+        if dist_m is None and dist_yd is not None:
+            dist_m = dist_yd * 0.9144
+        if dist_yd is None and dist_m is not None:
+            dist_yd = dist_m * 1.09361
+
+        normalised.append({
+            "hole_number":    h["hole_number"],
+            "par":            h.get("par"),
+            "handicap":       h.get("handicap"),
+            "tee_centroid":   [tee_lon, tee_lat] if tee_lon is not None else None,
+            "green_centroid": [grn_lon, grn_lat] if grn_lon is not None else None,
+            "length_m":       round(dist_m,  1) if dist_m  is not None else None,
+            "length_yards":   round(dist_yd, 0) if dist_yd is not None else None,
+            "routing_source": h.get("routing_source", "inferred"),
+            "bunkers":        h.get("bunkers", []),
+            "fairways":       h.get("fairways", []),
+        })
+    return normalised
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Course Replicator 2K — Full Pipeline",
@@ -227,13 +305,23 @@ Examples:
 
     if args.skip_features and features_path.exists():
         log.info("  Skipping feature extraction (--skip-features).")
-        holes_path    = output_dir / "holes_metadata.json"
+        # Use osm_holes_metadata.json (list format) — NOT holes_metadata.json
+        # which is the routing dict written by routing.py.
+        osm_holes_path = output_dir / "osm_holes_metadata.json"
+        _osm_holes = []
+        if osm_holes_path.exists() and _is_valid_cache(osm_holes_path):
+            try:
+                _osm_holes = json.loads(osm_holes_path.read_text(encoding="utf-8"))
+                if not isinstance(_osm_holes, list):
+                    _osm_holes = []
+            except Exception:
+                pass
         features_data = {
             "features_geojson": str(features_path),
-            "holes_metadata":   str(holes_path),
+            "holes_metadata":   str(osm_holes_path),
             "feature_map_path": str(output_dir / "feature_map.png"),
-            "holes":            json.loads(holes_path.read_text(encoding="utf-8")) if holes_path.exists() else [],
-            "hole_count":       0,
+            "holes":            _osm_holes,
+            "hole_count":       len(_osm_holes),
             "feature_counts":   {},
             "confidence_summary": {},
         }
@@ -272,7 +360,20 @@ Examples:
     # ── V3: Satellite-based tee detection (UPGRADE 5) ────────────────────────
     log.info("\n[V3] Detecting tee boxes from satellite imagery...")
     tees_path = output_dir / "tees.geojson"
-    if not tees_path.exists():
+    # A valid cache must exist, have content, and contain a FeatureCollection
+    # with at least one feature.  An empty FeatureCollection (from osm_features
+    # writing zero OSM tees) is NOT a valid cache — we regenerate it.
+    _tees_valid_cache = (
+        _is_valid_cache(tees_path) and
+        _geojson_has_features(tees_path)
+    )
+    if not getattr(config, "ENABLE_TEE_DETECTION", True):
+        log.info("  Tee detection disabled via config.")
+    elif _tees_valid_cache:
+        log.info(f"  Using cached tees.geojson ({tees_path.stat().st_size} bytes)")
+    else:
+        if tees_path.exists() and not _tees_valid_cache:
+            log.info("  tees.geojson exists but is empty/invalid — regenerating.")
         try:
             from pipeline.tee_detection import detect_tees
             mosaic_path = output_dir / "satellite_mosaic.jpg"
@@ -281,11 +382,10 @@ Examples:
                 output_dir=output_dir,
                 satellite_mosaic_path=mosaic_path if mosaic_path.exists() else None,
             )
-            log.info(f"  Tees detected: {tee_result.get('tee_count', 0)}")
+            n_tees = tee_result.get("tee_count", 0)
+            log.info(f"  Tees detected: {n_tees} — written to {tees_path.name}")
         except Exception as e:
             log.warning(f"  Tee detection failed (non-critical): {e}")
-    else:
-        log.info("  Using cached tees.geojson")
 
     # ── V3: Optional ML vision refinement (UPGRADE 6) ────────────────────────
     if config.ENABLE_ML_VISION:
@@ -305,19 +405,30 @@ Examples:
     log.info("\n[V2] Reconstructing course routing...")
     routing_data = {}
     routing_path = output_dir / "holes.geojson"
-    if routing_path.exists():
-        log.info("  Using cached routing (holes.geojson found)")
+    if _is_valid_cache(routing_path) and _geojson_has_features(routing_path):
+        log.info(f"  Using cached routing ({routing_path.name})")
         try:
-            import json as _json
-            _holes_meta = output_dir / "holes_metadata.json"
+            # Read actual hole properties from holes.geojson — do NOT read
+            # holes_metadata.json as a list (it is the routing dict, not holes).
+            _cached_feats = json.loads(routing_path.read_text(encoding="utf-8")).get("features", [])
+            # Keep only routing LineString/Point features (exclude fairway corridors)
+            _cached_holes = [
+                f["properties"] for f in _cached_feats
+                if f.get("properties", {}).get("hole_number")
+                   and f.get("geometry", {}).get("type") in ("LineString", "Point", None)
+                   and f.get("properties", {}).get("type") != "fairway_corridor"
+            ]
             routing_data = {
-                "hole_count": features_data.get("hole_count", 0),
-                "holes":      _json.loads(_holes_meta.read_text(encoding="utf-8")) if _holes_meta.exists() else [],
-                "holes_path": str(routing_path),
+                "hole_count":  len(_cached_holes),
+                "holes":       _cached_holes,
+                "holes_path":  str(routing_path),
             }
-        except Exception:
-            pass
-    else:
+            log.info(f"  Cached routing: {len(_cached_holes)} holes loaded")
+        except Exception as e:
+            log.warning(f"  Cached routing read failed ({e}) — re-running routing")
+            routing_data = {}
+
+    if not routing_data:
         try:
             from pipeline.routing import reconstruct_routing
             routing_data = reconstruct_routing(
@@ -332,6 +443,29 @@ Examples:
                 "hole_count": features_data.get("hole_count", 0),
                 "holes":      features_data.get("holes", []),
             }
+
+    # ── Inject routing holes into features_data for translation ──────────────
+    # features_data["holes"] comes from OSM only and is empty for most courses.
+    # Routing generates 18 holes; we normalise and merge them so that
+    # generate_build_pack() produces real yardage / hole counts.
+    routing_holes = routing_data.get("holes", [])
+    if routing_holes and not features_data.get("holes"):
+        normalised = _normalise_routing_holes(routing_holes)
+        features_data["holes"]      = normalised
+        features_data["hole_count"] = len(normalised)
+        log.info(
+            f"Translation: derived {len(normalised)} holes from routing "
+            f"(features_data was empty)"
+        )
+    elif routing_holes and len(routing_holes) > len(features_data.get("holes", [])):
+        # Routing produced more holes than OSM — prefer routing
+        normalised = _normalise_routing_holes(routing_holes)
+        features_data["holes"]      = normalised
+        features_data["hole_count"] = len(normalised)
+        log.info(
+            f"Translation: replaced {features_data.get('hole_count', 0)} OSM holes "
+            f"with {len(normalised)} routing holes (routing is more complete)"
+        )
 
     # ── Step 5: 2K translation + build pack ─────────────────────────────────
     log.info("\n[5/5] Generating 2K build pack...")
@@ -394,6 +528,7 @@ Examples:
             build_pack=build_pack,
             output_dir=output_dir,
             expected_scorecard=scorecard,
+            routing_data=routing_data,
         )
         log.info(f"  QA status: {qa_report['overall_status']}")
         if qa_report["warnings"]:

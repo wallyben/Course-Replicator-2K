@@ -99,11 +99,19 @@ PGA_2K_CANVAS_M = 1255
 TEE_SEARCH_MIN_M = 5
 TEE_SEARCH_MAX_M = 80
 
-# ─── Optional ML vision refinement ────────────────────────────────────────────
+# ─── Optional pipeline stages ─────────────────────────────────────────────────
+# Set False to disable tee box detection entirely (falls back to green-proximity heuristic).
+ENABLE_TEE_DETECTION = True
+
 # Set True to enable ML-based segmentation refinement (pipeline/ml_vision.py).
 # Requires optional heavy dependencies (torch, torchvision, etc.).
 # When False the pipeline behaves exactly as without this flag.
 ENABLE_ML_VISION = False
+
+# ─── Cache validation ──────────────────────────────────────────────────────────
+# Minimum file size (bytes) for a cache file to be considered valid.
+# Files smaller than this are treated as empty/corrupt and regenerated.
+INVALID_CACHE_MIN_BYTES = 10
 
 # ─── Output ───────────────────────────────────────────────────────────────────
 OUTPUT_DIR = "output"
