@@ -79,25 +79,41 @@ def reconstruct_routing(
         log.warning("No green data — routing incomplete")
         holes = _route_from_tees_only(tees)
     else:
-        # UPGRADE 2: multi-segment fairway graph routing (primary)
-        holes = _multi_segment_routing(osm_features_dir, greens, tees)
+        # ── PRIMARY: Corridor routing (tee→corridor→green) ───────────────────
+        # This is the most reliable method when fairway detection is sparse.
+        # It anchors on greens (reliably detected) and synthesizes tees for
+        # any greens that have no matching tee cluster within 550m.
+        holes = _corridor_routing(tees, greens, output_dir)
+
+        # ── FALLBACK 1: Multi-segment fairway graph ───────────────────────────
         if len(holes) < 9:
             log.info(
-                f"Multi-segment routing yielded {len(holes)} holes — "
+                f"Corridor routing yielded {len(holes)} holes — "
+                f"trying fairway graph fallback"
+            )
+            fw_holes = _multi_segment_routing(osm_features_dir, greens, tees)
+            if fw_holes and len(fw_holes) > len(holes):
+                log.info(f"Fairway graph: {len(fw_holes)} holes (better than corridor)")
+                holes = fw_holes
+
+        # ── FALLBACK 2: Skeleton routing ──────────────────────────────────────
+        if len(holes) < 9:
+            log.info(
+                f"Fairway graph yielded {len(holes)} holes — "
                 f"trying skeleton fallback"
             )
-            # Skeleton fallback
             skeleton_holes = _skeleton_routing(osm_features_dir, greens)
             if skeleton_holes and len(skeleton_holes) >= 9:
                 log.info(f"Skeleton fallback: {len(skeleton_holes)} holes")
                 holes = skeleton_holes
-            else:
-                # Pair-matching final fallback
-                log.info(
-                    f"Pair-matching fallback from {len(tees)} tees, "
-                    f"{len(greens)} greens"
-                )
-                holes = _pair_tees_to_greens(tees, greens)
+
+        # ── FALLBACK 3: Pair-matching ─────────────────────────────────────────
+        if len(holes) < 9:
+            log.info(
+                f"Pair-matching fallback from {len(tees)} tees, "
+                f"{len(greens)} greens"
+            )
+            holes = _pair_tees_to_greens(tees, greens)
 
     # UPGRADE 3: Order holes sequentially (each tee near previous green)
     clubhouse = _find_clubhouse_pos(osm_features_dir)
@@ -132,8 +148,10 @@ def reconstruct_routing(
         "routing_method":   "inferred",
         "source":           "vision + osm",
         "has_inferred_tees": all(
-            h.get("routing_source") in ("greens_only", "reconstructed",
-                                        "skeleton", "placeholder")
+            h.get("routing_source") in (
+                "greens_only", "reconstructed", "skeleton", "placeholder",
+                "corridor_matched", "corridor_synthesized",
+            )
             for h in holes
         ),
     }, indent=2)
@@ -789,6 +807,39 @@ def _cluster_tees_proper(
         kept.append(t)
 
     return kept
+
+
+# ─── Corridor routing (PRIMARY) ───────────────────────────────────────────────
+
+def _corridor_routing(
+    tees: List[dict],
+    greens: List[dict],
+    output_dir: Path,
+) -> List[dict]:
+    """
+    Primary routing method: green-anchored corridor reconstruction.
+
+    Delegates to pipeline.hole_corridor.reconstruct_corridors().
+    This approach does NOT depend on fairway detection — it works directly
+    from tee clusters + green centroids + satellite mosaic.
+
+    For each of the 18 greens:
+      - find nearest unassigned tee cluster ≤550m
+      - synthesize a tee if none found (placed 130m away from course centre)
+      - compute playable corridor between tee and green
+      - validate length (80–700m)
+
+    Returns hole list compatible with routing.py format, or [] on failure.
+    """
+    try:
+        from pipeline.hole_corridor import reconstruct_corridors
+        holes = reconstruct_corridors(tees, greens, output_dir)
+        if holes:
+            log.info(f"Corridor routing (primary): {len(holes)} holes")
+        return holes
+    except Exception as e:
+        log.warning(f"Corridor routing failed ({e}) — falling back to fairway graph")
+        return []
 
 
 def _multi_segment_routing(

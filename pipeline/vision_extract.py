@@ -279,9 +279,10 @@ def detect_features(
         log.debug(f"Overlay save failed: {e}")
 
     summary = {
-        "zoom":       zoom,
-        "image_size": [img_arr.shape[1], img_arr.shape[0]],
-        "detections": detections,
+        "zoom":             zoom,
+        "image_size":       [img_arr.shape[1], img_arr.shape[0]],
+        "transform_params": list(transform_params),  # (west, north, lon/px, lat/px)
+        "detections":       detections,
     }
     (output_dir / "vision_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
