@@ -10,6 +10,7 @@ fiona>=1.9.0
 # Raster processing
 rasterio>=1.3.0
 numpy>=1.24.0
+scipy>=1.11.0
 
 # Image export
 Pillow>=10.0.0
@@ -24,6 +25,16 @@ flask-compress>=1.14
 
 # Geospatial distance calculations
 geopy>=2.4.0
+
+# V2: Mapzen tile coordinates
+mercantile>=1.2.1
+
+# V2: Computer vision feature detection
+opencv-python>=4.8.0
+scikit-image>=0.21.0
+
+# V2: OSM Overpass wrapper
+overpy>=0.7
 
 # Optional: point cloud processing (only needed for INLP LAZ files)
 # Uncomment if you have PDAL installed:

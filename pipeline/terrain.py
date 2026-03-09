@@ -6,7 +6,14 @@ Outputs:
   - heightmap.png        16-bit greyscale PNG, normalised 0–65535
   - slope_map.png        Colour-shaded slope classification map
   - terrain_regions.tif  Raster: 1=flat, 2=gentle, 3=moderate, 4=steep
+  - terrain_regions.geojson  Vector polygons per terrain class (V2)
   - terrain_stats.json   {z_min, z_max, z_range, slope_mean, resolution_m, ...}
+
+V2 hardening:
+  - validate_dem_integrity called before processing
+  - NaN cells filled with spatial median before gradient (not mean)
+  - Gaussian smoothing applied to reduce sensor noise
+  - terrain_regions.geojson exported as vector polygons
 """
 
 import json
@@ -77,6 +84,16 @@ def process_terrain(dtm_path: Path, boundary_data: dict, output_dir: Path) -> di
     if nodata is not None:
         dtm_arr[dtm_arr == nodata] = np.nan
 
+    # V2: Validate DEM integrity before any processing
+    from pipeline.lidar import validate_dem_integrity
+    validate_dem_integrity(dtm_clipped_path)
+
+    # V2: Fill NaN cells with spatial median (more robust than mean for sparse nodata)
+    dtm_arr = _median_fill_nan(dtm_arr)
+
+    # V2: Gaussian smoothing to reduce LiDAR/DEM noise
+    dtm_arr = _gaussian_smooth(dtm_arr)
+
     # Step 4: Compute statistics
     valid = dtm_arr[~np.isnan(dtm_arr)]
     z_min  = float(np.nanmin(dtm_arr))
@@ -105,6 +122,14 @@ def process_terrain(dtm_path: Path, boundary_data: dict, output_dir: Path) -> di
     regions_arr = _classify_terrain(slope_arr)
     regions_path = output_dir / "terrain_regions.tif"
     _write_raster(regions_arr.astype(np.uint8), regions_path, dtm_clipped_path)
+
+    # V2: Export terrain regions as GeoJSON vector polygons
+    regions_geojson_path = output_dir / "terrain_regions.geojson"
+    try:
+        _export_terrain_regions_geojson(regions_arr, dtm_clipped_path, regions_geojson_path)
+        log.info(f"Terrain regions GeoJSON: {regions_geojson_path}")
+    except Exception as e:
+        log.warning(f"terrain_regions.geojson export failed (non-critical): {e}")
 
     # Step 8: Slope map image
     slope_map_path = output_dir / "slope_map.png"
@@ -240,18 +265,67 @@ def _generate_heightmap(dtm_arr: np.ndarray, out_path: Path) -> None:
     log.info(f"Heightmap saved: {out_path} ({size}×{size}px, 16-bit)")
 
 
+# ─── V2: NaN fill and smoothing ──────────────────────────────────────────────
+
+def _median_fill_nan(arr: np.ndarray, kernel: int = 5) -> np.ndarray:
+    """
+    V2: Fill NaN cells with local spatial median.
+    Falls back to global median for isolated large nodata regions.
+    Uses iterative passes so islands of NaN surrounded by valid data
+    are filled before the global fallback is needed.
+    """
+    from scipy.ndimage import generic_filter
+
+    if not np.any(np.isnan(arr)):
+        return arr
+
+    out = arr.copy()
+    global_median = float(np.nanmedian(arr))
+
+    # Up to 3 passes for NaN-surrounded cells
+    for _ in range(3):
+        if not np.any(np.isnan(out)):
+            break
+        nan_mask = np.isnan(out)
+
+        def _local_median(values):
+            valid = values[~np.isnan(values)]
+            return float(np.median(valid)) if len(valid) > 0 else np.nan
+
+        filled = generic_filter(
+            out, _local_median,
+            size=kernel, mode="nearest"
+        )
+        out[nan_mask] = filled[nan_mask]
+
+    # Any remaining NaN → global median
+    out = np.where(np.isnan(out), global_median, out)
+    return out.astype(np.float32)
+
+
+def _gaussian_smooth(arr: np.ndarray, sigma: float = 1.0) -> np.ndarray:
+    """
+    V2: Apply Gaussian smoothing to reduce LiDAR/DEM point noise.
+    sigma=1.0 is gentle — preserves macro terrain while killing sensor spikes.
+    """
+    from scipy.ndimage import gaussian_filter
+    return gaussian_filter(arr, sigma=sigma).astype(np.float32)
+
+
 # ─── Slope ────────────────────────────────────────────────────────────────────
 
 def _compute_slope(dtm_arr: np.ndarray, resolution_m: float) -> np.ndarray:
     """
-    Compute slope in degrees from a DTM array.
-    Uses central difference (numpy gradient).
+    V2: NaN-safe slope computation using central difference (numpy gradient).
+    Array must be pre-filled (no NaN) by _median_fill_nan before calling.
     """
-    # Fill NaN with mean for gradient computation
-    filled = np.where(np.isnan(dtm_arr), np.nanmean(dtm_arr), dtm_arr)
-    dy, dx = np.gradient(filled, resolution_m, resolution_m)
+    # Guard: if somehow NaN remain, fill with median
+    if np.any(np.isnan(dtm_arr)):
+        fill = float(np.nanmedian(dtm_arr))
+        dtm_arr = np.where(np.isnan(dtm_arr), fill, dtm_arr)
+
+    dy, dx = np.gradient(dtm_arr, resolution_m, resolution_m)
     slope = np.degrees(np.arctan(np.sqrt(dx**2 + dy**2)))
-    slope[np.isnan(dtm_arr)] = np.nan
     return slope.astype(np.float32)
 
 
@@ -325,6 +399,57 @@ def z_to_2k(z_m: float, terrain_stats: dict) -> float:
         return 50.0
     val = (z_m - z_min) / z_range * config.TK2_HEIGHT_MAX
     return round(max(0.0, min(100.0, val)), 1)
+
+
+# ─── V2: GeoJSON terrain regions export ──────────────────────────────────────
+
+def _export_terrain_regions_geojson(
+    regions_arr: np.ndarray,
+    template_raster: Path,
+    out_path: Path,
+) -> None:
+    """
+    V2: Vectorise terrain_regions raster → GeoJSON polygons.
+    Each feature has class (1–4) and label properties.
+    """
+    import json
+    from rasterio.features import shapes
+    from shapely.geometry import shape as shp_shape, mapping
+
+    labels = {1: "flat", 2: "gentle", 3: "moderate", 4: "steep"}
+
+    with rasterio.open(template_raster) as src:
+        transform = src.transform
+        crs = src.crs
+
+    # Reproject to WGS84 for GeoJSON output
+    t_to_wgs84 = Transformer.from_crs(crs.to_epsg(), 4326, always_xy=True)
+    from shapely.ops import transform as shp_transform
+
+    features = []
+    for region_class in [1, 2, 3, 4]:
+        mask = (regions_arr == region_class).astype(np.uint8)
+        for geom, val in shapes(mask, mask=mask, transform=transform):
+            if val == 0:
+                continue
+            poly = shp_shape(geom)
+            if poly.area < 1:
+                continue
+            try:
+                poly_wgs84 = shp_transform(t_to_wgs84.transform, poly)
+            except Exception:
+                poly_wgs84 = poly
+            features.append({
+                "type": "Feature",
+                "geometry": mapping(poly_wgs84),
+                "properties": {
+                    "class": int(region_class),
+                    "label": labels.get(region_class, "unknown"),
+                },
+            })
+
+    geojson = {"type": "FeatureCollection", "features": features}
+    out_path.write_text(json.dumps(geojson, indent=2))
 
 
 # ─── Utility: write classified raster ────────────────────────────────────────

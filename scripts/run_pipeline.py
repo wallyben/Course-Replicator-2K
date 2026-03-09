@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-run_pipeline.py — Main CLI entry point for Course Replicator 2K.
+run_pipeline.py — Main CLI entry point for Course Replicator 2K (Version 2).
 
 Usage:
     python scripts/run_pipeline.py "Old Conna Golf Club"
@@ -10,6 +10,18 @@ Usage:
 
 After running, start the companion app:
     python companion/app.py --course output/old-conna-golf-club
+
+V2 enhancements (transparent to CLI):
+  FIX 1: Mapzen Terrarium tiles as reliable global elevation fallback
+  FIX 2: DEM integrity validation before terrain processing
+  FIX 3: Automatic bbox area refinement 40-200 ha
+  FIX 4: Corrected EU-DEM LAEA tile naming with 3x retry
+  UPGRADE 1: Irish LiDAR acquisition module
+  UPGRADE 2: OSM per-type GeoJSON extraction
+  UPGRADE 3: Satellite vision feature detection
+  UPGRADE 4: Course routing reconstruction
+  PART 3: NaN-safe terrain with Gaussian smoothing
+  PART 4: Enhanced build pack with PDF blueprints + HTML report
 """
 
 import argparse
@@ -152,16 +164,43 @@ Examples:
         log.info("  Using cached DTM.")
         lidar_coverage = "cached"
     else:
-        from pipeline.lidar import acquire_elevation
+        # V2 UPGRADE 1: Try Irish LiDAR first if course is in Ireland
+        lidar_coverage = None
+        bbox_wgs84 = boundary_data["bbox_wgs84"]
+
         try:
-            dtm_path, lidar_coverage = acquire_elevation(boundary_data, output_dir)
-            log.info(f"  Coverage: {lidar_coverage}")
+            from pipeline.lidar_ireland import acquire_irish_lidar, is_ireland
+            if is_ireland(bbox_wgs84):
+                log.info("  V2: Attempting Irish National LiDAR Programme...")
+                dtm_path_irl, irl_label = acquire_irish_lidar(bbox_wgs84, output_dir)
+                if dtm_path_irl and dtm_path_irl.exists():
+                    dtm_path = dtm_path_irl
+                    lidar_coverage = irl_label
+                    log.info(f"  Irish LiDAR acquired: {irl_label}")
+        except Exception as e:
+            log.warning(f"  Irish LiDAR module error (falling back): {e}")
+
+        # Standard fallback chain (includes Mapzen — FIX 1)
+        if not lidar_coverage:
+            from pipeline.lidar import acquire_elevation
+            try:
+                dtm_path, lidar_coverage = acquire_elevation(boundary_data, output_dir)
+                log.info(f"  Coverage: {lidar_coverage}")
+            except RuntimeError as e:
+                log.error(f"Elevation acquisition failed: {e}")
+                log.error(
+                    "\nThe pipeline cannot continue without elevation data. "
+                    "Check your internet connection and try again."
+                )
+                sys.exit(1)
+
+        # V2 FIX 2: Validate DEM integrity explicitly
+        try:
+            from pipeline.lidar import validate_dem_integrity
+            validate_dem_integrity(dtm_path)
+            log.info("  DEM integrity check passed.")
         except RuntimeError as e:
-            log.error(f"Elevation acquisition failed: {e}")
-            log.error(
-                "\nThe pipeline cannot continue without elevation data. "
-                "Check your internet connection and try again."
-            )
+            log.error(f"DEM validation failed: {e}")
             sys.exit(1)
 
     # ── Step 3: Terrain processing ───────────────────────────────────────────
@@ -209,6 +248,59 @@ Examples:
             log.exception(e)
             sys.exit(1)
 
+    # ── V2: OSM per-type feature extraction (UPGRADE 2) ─────────────────────
+    log.info("\n[V2] Extracting per-type OSM golf features...")
+    osm_summary = {}
+    try:
+        from pipeline.osm_features import extract_osm_features
+        osm_summary = extract_osm_features(boundary_data, output_dir)
+        log.info(f"  OSM features: {osm_summary.get('counts', {})}")
+    except Exception as e:
+        log.warning(f"  OSM feature extraction failed (non-critical): {e}")
+
+    # ── V2: Satellite vision feature detection (UPGRADE 3) ───────────────────
+    log.info("\n[V2] Running satellite vision feature detection...")
+    try:
+        from pipeline.vision_extract import detect_features, merge_vision_with_osm
+        vision_summary = detect_features(boundary_data["bbox_wgs84"], output_dir, zoom=16)
+        if vision_summary.get("detections"):
+            merge_stats = merge_vision_with_osm(vision_summary, output_dir)
+            log.info(f"  Vision detections merged: {merge_stats}")
+    except Exception as e:
+        log.warning(f"  Vision extraction failed (non-critical): {e}")
+
+    # ── V2: Course routing reconstruction (UPGRADE 4) ─────────────────────────
+    log.info("\n[V2] Reconstructing course routing...")
+    routing_data = {}
+    routing_path = output_dir / "holes.geojson"
+    if routing_path.exists():
+        log.info("  Using cached routing (holes.geojson found)")
+        try:
+            import json as _json
+            _holes_meta = output_dir / "holes_metadata.json"
+            routing_data = {
+                "hole_count": features_data.get("hole_count", 0),
+                "holes":      _json.loads(_holes_meta.read_text()) if _holes_meta.exists() else [],
+                "holes_path": str(routing_path),
+            }
+        except Exception:
+            pass
+    else:
+        try:
+            from pipeline.routing import reconstruct_routing
+            routing_data = reconstruct_routing(
+                features_data=features_data,
+                output_dir=output_dir,
+                osm_features_dir=output_dir,
+            )
+            log.info(f"  Routing: {routing_data.get('hole_count', 0)} holes → holes.geojson")
+        except Exception as e:
+            log.warning(f"  Routing reconstruction failed (non-critical): {e}")
+            routing_data = {
+                "hole_count": features_data.get("hole_count", 0),
+                "holes":      features_data.get("holes", []),
+            }
+
     # ── Step 5: 2K translation + build pack ─────────────────────────────────
     log.info("\n[5/5] Generating 2K build pack...")
 
@@ -238,6 +330,26 @@ Examples:
         log.error(f"Build pack generation failed: {e}")
         log.exception(e)
         sys.exit(1)
+
+    # ── V2: Enhanced build pack (PART 4) ─────────────────────────────────────
+    log.info("\n[V2] Generating enhanced build pack...")
+    try:
+        from pipeline.buildpack import generate_enhanced_buildpack
+        enhanced_pack = generate_enhanced_buildpack(
+            boundary_data=boundary_data,
+            terrain_stats=terrain_stats,
+            features_data=features_data,
+            routing_data=routing_data,
+            output_dir=output_dir,
+            course_type=args.type,
+            osm_features_dir=output_dir,
+        )
+        log.info("  Enhanced outputs:")
+        for key, path in enhanced_pack.get("outputs", {}).items():
+            if path:
+                log.info(f"    {key}: {Path(path).name}")
+    except Exception as e:
+        log.warning(f"  Enhanced build pack failed (non-critical): {e}")
 
     # ── QA ───────────────────────────────────────────────────────────────────
     log.info("\nRunning QA checks...")

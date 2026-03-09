@@ -10,6 +10,7 @@ Resolves a golf course name to:
 
 import json
 import logging
+import math
 import time
 from typing import Optional
 
@@ -27,6 +28,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import config
 
 log = logging.getLogger(__name__)
+
+# FIX 3: Bbox area constraints (hectares → m²)
+_BBOX_AREA_MIN_M2 = 40  * 10_000   # 40 ha
+_BBOX_AREA_MAX_M2 = 200 * 10_000   # 200 ha
 
 
 # ─── Overpass query templates ─────────────────────────────────────────────────
@@ -260,10 +265,17 @@ def boundary_from_bbox(
     """
     Create boundary data from a manually entered bounding box (WGS84).
     Use this if OSM boundary resolution fails.
+
+    FIX 3: Automatically refines bbox to 40–200 ha by querying OSM for the
+    actual golf_course polygon, then falling back to fairway cluster sizing.
     """
     from shapely.geometry import box as shapely_box
     from shapely.ops import transform
     from pyproj import Transformer
+
+    # FIX 3: Attempt to refine oversized/undersized bbox via OSM
+    refined = _refine_bbox(min_lon, min_lat, max_lon, max_lat, course_name)
+    min_lon, min_lat, max_lon, max_lat = refined
 
     polygon = shapely_box(min_lon, min_lat, max_lon, max_lat)
     centroid = polygon.centroid
@@ -288,6 +300,217 @@ def boundary_from_bbox(
         "area_m2":             polygon_itm.area,
         "confidence":          "LOW",
     }
+
+
+# ─── FIX 3: Bbox refinement ───────────────────────────────────────────────────
+
+def _refine_bbox(
+    min_lon: float, min_lat: float, max_lon: float, max_lat: float,
+    course_name: str,
+) -> tuple:
+    """
+    FIX 3: Refine bounding box to stay within 40–200 ha.
+
+    Algorithm:
+      1. Query OSM for golf_course polygon within the initial bbox
+      2. If found → use polygon bounds (tightest, most accurate)
+      3. Otherwise → query fairway cluster and expand 120%
+      4. Clamp result to [40 ha, 200 ha] around centroid
+
+    Returns:
+        (min_lon, min_lat, max_lon, max_lat) refined WGS84 tuple
+    """
+    from shapely.geometry import box as shapely_box
+    from shapely.ops import transform, unary_union
+    from pyproj import Transformer
+
+    t_to_itm = Transformer.from_crs("EPSG:4326", "EPSG:2157", always_xy=True)
+
+    # Measure initial area
+    init_poly_itm = transform(
+        t_to_itm.transform,
+        shapely_box(min_lon, min_lat, max_lon, max_lat)
+    )
+    init_area = init_poly_itm.area
+    center_lon = (min_lon + max_lon) / 2
+    center_lat = (min_lat + max_lat) / 2
+
+    log.debug(f"Initial bbox area: {init_area/10000:.1f} ha")
+
+    # Step 1: Try OSM golf_course polygon within bbox
+    try:
+        osm_poly = _query_golf_course_polygon(min_lon, min_lat, max_lon, max_lat)
+        if osm_poly is not None:
+            bounds = osm_poly.bounds
+            poly_itm = transform(t_to_itm.transform, osm_poly)
+            area = poly_itm.area
+            if _BBOX_AREA_MIN_M2 <= area <= _BBOX_AREA_MAX_M2:
+                log.info(f"FIX 3: Using OSM golf_course polygon ({area/10000:.1f} ha)")
+                return bounds  # (min_lon, min_lat, max_lon, max_lat)
+            elif area < _BBOX_AREA_MIN_M2:
+                log.debug(f"OSM polygon too small ({area/10000:.1f} ha), expanding")
+                return _clamp_bbox_around_centroid(
+                    bounds[0], bounds[1], bounds[2], bounds[3],
+                    center_lon, center_lat, t_to_itm
+                )
+            else:
+                log.debug(f"OSM polygon too large ({area/10000:.1f} ha), clamping")
+                return _clamp_bbox_around_centroid(
+                    bounds[0], bounds[1], bounds[2], bounds[3],
+                    center_lon, center_lat, t_to_itm
+                )
+    except Exception as e:
+        log.debug(f"FIX 3: OSM golf_course query failed: {e}")
+
+    # Step 2: If initial bbox is already in range, keep it
+    if _BBOX_AREA_MIN_M2 <= init_area <= _BBOX_AREA_MAX_M2:
+        log.debug("FIX 3: Initial bbox already in range, keeping")
+        return (min_lon, min_lat, max_lon, max_lat)
+
+    # Step 3: Try fairway cluster sizing
+    try:
+        fairway_bbox = _query_fairway_cluster_bbox(min_lon, min_lat, max_lon, max_lat)
+        if fairway_bbox is not None:
+            fw_min_lon, fw_min_lat, fw_max_lon, fw_max_lat = fairway_bbox
+            # Expand 120%
+            fw_poly = shapely_box(fw_min_lon, fw_min_lat, fw_max_lon, fw_max_lat)
+            fw_itm = transform(t_to_itm.transform, fw_poly)
+            cx_itm, cy_itm = fw_itm.centroid.x, fw_itm.centroid.y
+            hw = math.sqrt(fw_itm.area * 1.2) / 2
+            log.info(f"FIX 3: Using 120% fairway cluster bbox ({fw_itm.area*1.2/10000:.1f} ha est.)")
+            return _clamp_bbox_around_centroid(
+                fw_min_lon, fw_min_lat, fw_max_lon, fw_max_lat,
+                center_lon, center_lat, t_to_itm
+            )
+    except Exception as e:
+        log.debug(f"FIX 3: Fairway cluster query failed: {e}")
+
+    # Step 4: Clamp oversized initial bbox around centroid
+    return _clamp_bbox_around_centroid(
+        min_lon, min_lat, max_lon, max_lat,
+        center_lon, center_lat, t_to_itm
+    )
+
+
+def _clamp_bbox_around_centroid(
+    min_lon, min_lat, max_lon, max_lat,
+    center_lon, center_lat, t_to_itm
+) -> tuple:
+    """
+    Clamp bbox to [40–200 ha] centered on centroid, preserving aspect ratio.
+    """
+    from shapely.geometry import box as shapely_box
+    from shapely.ops import transform
+
+    poly_itm = transform(
+        t_to_itm.transform,
+        shapely_box(min_lon, min_lat, max_lon, max_lat)
+    )
+    area = poly_itm.area
+
+    if area < _BBOX_AREA_MIN_M2:
+        target_area = _BBOX_AREA_MIN_M2
+    elif area > _BBOX_AREA_MAX_M2:
+        target_area = _BBOX_AREA_MAX_M2
+    else:
+        return (min_lon, min_lat, max_lon, max_lat)
+
+    # Scale factor to achieve target area
+    scale = math.sqrt(target_area / max(area, 1.0))
+    half_lon = (max_lon - min_lon) / 2 * scale
+    half_lat = (max_lat - min_lat) / 2 * scale
+
+    # Maintain a minimum half-span of ~500m (~0.005°)
+    half_lon = max(half_lon, 0.005)
+    half_lat = max(half_lat, 0.004)
+
+    new_min_lon = center_lon - half_lon
+    new_max_lon = center_lon + half_lon
+    new_min_lat = center_lat - half_lat
+    new_max_lat = center_lat + half_lat
+
+    new_area = transform(
+        t_to_itm.transform,
+        shapely_box(new_min_lon, new_min_lat, new_max_lon, new_max_lat)
+    ).area
+    log.info(f"FIX 3: Bbox clamped from {area/10000:.1f} ha → {new_area/10000:.1f} ha")
+    return (new_min_lon, new_min_lat, new_max_lon, new_max_lat)
+
+
+def _query_golf_course_polygon(min_lon, min_lat, max_lon, max_lat):
+    """
+    Query Overpass for a golf_course polygon within the bbox.
+    Returns largest Shapely polygon found, or None.
+    """
+    from shapely.geometry import MultiPolygon
+
+    query = f"""
+[out:json][timeout:30];
+(
+  way["leisure"="golf_course"]({min_lat},{min_lon},{max_lat},{max_lon});
+  relation["leisure"="golf_course"]({min_lat},{min_lon},{max_lat},{max_lon});
+);
+out body;
+>;
+out skel qt;
+"""
+    resp = _overpass_request(query, retries=2)
+    elements = resp.get("elements", [])
+    if not elements:
+        return None
+
+    poly = _ways_to_polygon(elements)
+    if poly is None:
+        return None
+    if poly.geom_type == "MultiPolygon":
+        poly = max(poly.geoms, key=lambda p: p.area)
+    return poly
+
+
+def _query_fairway_cluster_bbox(min_lon, min_lat, max_lon, max_lat):
+    """
+    Query Overpass for fairway polygons within bbox.
+    Returns bounding box of all fairways as (min_lon, min_lat, max_lon, max_lat), or None.
+    """
+    from shapely.geometry import box as shapely_box
+    from shapely.ops import unary_union
+
+    query = f"""
+[out:json][timeout:30];
+(
+  way["golf"="fairway"]({min_lat},{min_lon},{max_lat},{max_lon});
+  way["golf"="green"]({min_lat},{min_lon},{max_lat},{max_lon});
+);
+out body;
+>;
+out skel qt;
+"""
+    resp = _overpass_request(query, retries=2)
+    elements = resp.get("elements", [])
+    if not elements:
+        return None
+
+    node_map = _reconstruct_nodes(elements)
+    polygons = []
+    for el in elements:
+        if el["type"] != "way":
+            continue
+        coords = _reconstruct_way_coords(el.get("nodes", []), node_map)
+        if len(coords) >= 4:
+            try:
+                from shapely.geometry import Polygon
+                p = Polygon(coords)
+                if p.is_valid and p.area > 0:
+                    polygons.append(p)
+            except Exception:
+                continue
+
+    if not polygons:
+        return None
+
+    merged = unary_union(polygons)
+    bounds = merged.bounds  # (min_lon, min_lat, max_lon, max_lat)
+    return bounds
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────

@@ -5,15 +5,19 @@ Priority chain:
   1. Tailte Éireann Irish National LiDAR Programme (INLP) — 0.5–1m, Ireland
   2. EU-DEM v1.1 via Copernicus / OpenTopography — 25m, full Europe
   3. SRTM 30m via OpenTopography API — 30m, global fallback
+  4. Mapzen Terrarium tiles (AWS) — ~38m, global primary fallback  [V2 NEW]
+  5. Open-Elevation API — 90m, zero-dependency last resort
 
 Output:
   - dtm.tif   — Digital Terrain Model clipped to buffered bounding box
   - coverage  — string describing which source was used
 """
 
+import io
 import logging
 import math
 import os
+import shutil
 import time
 import zipfile
 from pathlib import Path
@@ -55,21 +59,72 @@ def acquire_elevation(boundary_data: dict, output_dir: Path) -> Tuple[Path, str]
         (_try_inlp,       "Irish National LiDAR Programme (INLP) — 0.5m"),
         (_try_eudem,      "EU-DEM v1.1 (Copernicus) — 25m"),
         (_try_srtm,       "SRTM v3 (NASA) — 30m"),
+        (_try_mapzen,     "Mapzen Terrarium tiles (AWS) — 38m"),   # V2: reliable global fallback
         (_try_open_elev,  "Open-Elevation API — 90m"),
     ]:
         try:
-            log.info(f"Trying LiDAR source: {label}")
+            log.info(f"Trying elevation source: {label}")
             result = source_fn(bbox_wgs84, dtm_path)
             if result and dtm_path.exists():
+                # V2: validate DEM integrity before accepting
+                validate_dem_integrity(dtm_path)
                 log.info(f"Elevation acquired from: {label}")
                 return dtm_path, label
+        except RuntimeError as e:
+            log.warning(f"Source failed ({label}): {e}")
+            if dtm_path.exists():
+                dtm_path.unlink(missing_ok=True)
         except Exception as e:
             log.warning(f"Source failed ({label}): {e}")
+            if dtm_path.exists():
+                dtm_path.unlink(missing_ok=True)
 
     raise RuntimeError(
         "All elevation sources failed. Check your internet connection and "
-        "verify the bounding box covers a valid location in Ireland."
+        "verify the bounding box covers a valid location."
     )
+
+
+# ─── V2: DEM integrity validation ─────────────────────────────────────────────
+
+def validate_dem_integrity(dtm_path: Path) -> None:
+    """
+    FIX 2: Validate DEM has usable elevation data before terrain processing.
+
+    Raises:
+        RuntimeError: if DEM is empty, too small, or entirely NaN/nodata.
+    """
+    import rasterio
+
+    if not dtm_path.exists():
+        raise RuntimeError("DEM contains no valid elevation data")
+
+    with rasterio.open(dtm_path) as src:
+        arr = src.read(1).astype(np.float32)
+        nodata = src.nodata
+
+    if arr.size == 0:
+        raise RuntimeError("DEM contains no valid elevation data")
+
+    if arr.shape[0] < 4 or arr.shape[1] < 4:
+        raise RuntimeError("DEM contains no valid elevation data")
+
+    if nodata is not None:
+        arr[arr == nodata] = np.nan
+
+    if np.all(np.isnan(arr)):
+        raise RuntimeError("DEM contains no valid elevation data")
+
+    valid_count = int(np.sum(~np.isnan(arr)))
+    total = arr.size
+    valid_pct = valid_count / total * 100
+    if valid_pct < 10.0:
+        raise RuntimeError(
+            f"DEM contains no valid elevation data "
+            f"(only {valid_pct:.1f}% valid pixels)"
+        )
+
+    log.debug(f"DEM integrity OK: {arr.shape}, {valid_pct:.1f}% valid")
 
 
 # ─── Source: INLP (Tailte Éireann) ───────────────────────────────────────────
@@ -83,8 +138,6 @@ def _try_inlp(bbox_wgs84: list, output_path: Path) -> bool:
 
     Returns True if successful, False/raises if not.
     """
-    # Tailte Éireann WCS endpoint for lidar DTM
-    # Service: National LiDAR Programme - Bare Earth (DTM) 0.5m
     WCS_BASE = "https://wms.tailte.ie/inspire/ows"
 
     min_lon, min_lat, max_lon, max_lat = bbox_wgs84
@@ -107,65 +160,87 @@ def _try_inlp(bbox_wgs84: list, output_path: Path) -> bool:
 
     content_type = resp.headers.get("Content-Type", "")
     if "tiff" not in content_type.lower() and "geotiff" not in content_type.lower():
-        # Likely returned an error XML
         raise RuntimeError(f"INLP WCS returned non-TIFF content: {content_type}")
 
     with open(output_path, "wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
             f.write(chunk)
 
-    # Validate it's a real raster
     _validate_tif(output_path)
     return True
 
 
-# ─── Source: EU-DEM ───────────────────────────────────────────────────────────
+# ─── Source: EU-DEM (FIX 4 — corrected tile resolution) ──────────────────────
 
 def _try_eudem(bbox_wgs84: list, output_path: Path) -> bool:
     """
-    Fetch EU-DEM 25m via OpenTopography hosted raster (publicly accessible GeoTIFF).
-    Covers all of Ireland at 25m resolution.
+    FIX 4: Fetch EU-DEM 25m using correct ETRS89-LAEA 1000km tile grid.
+
+    Tile naming: eu_dem_v11_E{XX}N{YY}.TIF
+    Where XX = floor(LAEA_easting / 1_000_000) * 10
+          YY = floor(LAEA_northing / 1_000_000) * 10
+
+    Retries up to 3 times per candidate tile.
     """
-    import rasterio
-    from rasterio.transform import from_bounds
-    from rasterio.warp import reproject, Resampling
+    from pyproj import Transformer
 
     min_lon, min_lat, max_lon, max_lat = bbox_wgs84
+    center_lon = (min_lon + max_lon) / 2
+    center_lat = (min_lat + max_lat) / 2
 
-    # OpenTopography EU_DEM endpoint
-    url = (
-        "https://portal.opentopography.org/API/globaldem"
-        "?demtype=SRTMGL1"  # Use SRTM as proxy — see _try_srtm for proper SRTM
-    )
-    # EU-DEM via direct Copernicus STAC is complex; use SRTM as the 30m fallback instead.
-    # This function tries a direct STAC fetch of EU_DEM tiles.
+    # Convert centroid to ETRS89-LAEA (EPSG:3035)
+    t = Transformer.from_crs("EPSG:4326", "EPSG:3035", always_xy=True)
+    x_laea, y_laea = t.transform(center_lon, center_lat)
 
-    # EU-DEM tile naming: EU_DEM_be_{lat}_{lon} for 5° tiles
-    tile_lat = int(math.floor(min_lat / 5)) * 5
-    tile_lon = int(math.floor(min_lon / 5)) * 5
-    ns = "N" if tile_lat >= 0 else "S"
-    ew = "E" if tile_lon >= 0 else "W"
-    tile_name = f"eu_dem_v11_{ns}{abs(tile_lat):02d}{ew}{abs(tile_lon):03d}.TIF"
+    # Tile grid: 1000km × 1000km, named by dividing by 100_000 (gives 2-digit 100km unit)
+    tile_e = int(x_laea // 100000)
+    tile_n = int(y_laea // 100000)
+    primary_tile = f"eu_dem_v11_E{tile_e}N{tile_n}.TIF"
 
-    # Copernicus Land Monitoring Service
-    base_url = "https://land.copernicus.eu/en/products/eu-dem/eu-dem-v1.1"
-    tile_url = f"https://download.gisco.eu/collection/eu_dem/v1.1/eu_dem_v11_E30N20.TIF"
+    # Generate candidate tiles — try neighbours if primary fails
+    candidate_tiles = [
+        primary_tile,
+        f"eu_dem_v11_E{tile_e-1}N{tile_n}.TIF",
+        f"eu_dem_v11_E{tile_e}N{tile_n-1}.TIF",
+        f"eu_dem_v11_E{tile_e+1}N{tile_n}.TIF",
+        # Known Ireland tile as final fallback
+        "eu_dem_v11_E30N20.TIF",
+    ]
+    # Deduplicate preserving order
+    seen = set()
+    candidates = []
+    for t_name in candidate_tiles:
+        if t_name not in seen:
+            seen.add(t_name)
+            candidates.append(t_name)
 
-    # Direct download URL for Ireland tile (E30N20 covers British Isles/Ireland)
-    ireland_tile_url = (
-        "https://opentopography.s3.sdsc.edu/raster/EU_DEM/EU_DEM_be_5deg/"
-        "eu_dem_v11_E30N20.TIF"
-    )
-
+    base_url = f"{config.EUDEM_BASE_URL}"
     tmp_tile = output_path.parent / "eudem_tile.tif"
-    _download_file(ireland_tile_url, tmp_tile, desc="EU-DEM tile")
-    if not tmp_tile.exists():
-        raise RuntimeError("EU-DEM tile download failed")
 
-    # Clip to bounding box and write
-    _clip_raster(tmp_tile, output_path, bbox_wgs84)
-    tmp_tile.unlink(missing_ok=True)
-    return True
+    for tile_name in candidates:
+        tile_url = f"{base_url}/{tile_name}"
+        log.debug(f"EU-DEM trying tile: {tile_name}")
+
+        for attempt in range(3):
+            try:
+                _download_file(tile_url, tmp_tile, desc=f"EU-DEM {tile_name}")
+                if tmp_tile.exists() and tmp_tile.stat().st_size > 10000:
+                    _clip_raster(tmp_tile, output_path, bbox_wgs84)
+                    tmp_tile.unlink(missing_ok=True)
+                    return True
+                else:
+                    tmp_tile.unlink(missing_ok=True)
+                    break
+            except Exception as e:
+                tmp_tile.unlink(missing_ok=True)
+                if attempt < 2:
+                    wait = 2 ** attempt
+                    log.debug(f"EU-DEM attempt {attempt+1} failed: {e}. Retry in {wait}s")
+                    time.sleep(wait)
+                else:
+                    log.debug(f"EU-DEM tile {tile_name} exhausted retries: {e}")
+
+    raise RuntimeError(f"EU-DEM: all candidate tiles failed for centroid ({center_lon:.3f},{center_lat:.3f})")
 
 
 # ─── Source: SRTM 30m ────────────────────────────────────────────────────────
@@ -207,7 +282,136 @@ def _try_srtm(bbox_wgs84: list, output_path: Path) -> bool:
     return True
 
 
-# ─── Source: Open-Elevation API (90m SRTM, zero-dependency fallback) ─────────
+# ─── Source: Mapzen Terrarium tiles (FIX 1 — reliable global fallback) ───────
+
+def _try_mapzen(bbox_wgs84: list, output_path: Path) -> bool:
+    """
+    FIX 1: Download Mapzen Terrarium elevation tiles from AWS S3.
+
+    URL: https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png
+    Encoding: elevation = (R * 256 + G + B / 256) - 32768 metres
+    Zoom 12 ≈ 38m/pixel resolution — sufficient for terrain modelling.
+    """
+    return download_mapzen_dem(bbox_wgs84, output_path)
+
+
+def download_mapzen_dem(bbox_wgs84: list, output_path: Path, zoom: int = 12) -> bool:
+    """
+    Download Mapzen Terrarium tiles, decode elevation, merge into GeoTIFF.
+
+    Args:
+        bbox_wgs84:  [min_lon, min_lat, max_lon, max_lat]
+        output_path: Destination GeoTIFF path
+        zoom:        Tile zoom level (12 ≈ 38m/px, 13 ≈ 19m/px)
+
+    Returns:
+        True on success, raises RuntimeError on failure.
+    """
+    try:
+        import mercantile
+    except ImportError:
+        raise RuntimeError("mercantile not installed — pip install mercantile")
+
+    import rasterio
+    from rasterio.transform import from_bounds
+    from rasterio.crs import CRS
+    from rasterio.merge import merge as rio_merge
+    from PIL import Image
+
+    TERRARIUM_URL = (
+        "https://s3.amazonaws.com/elevation-tiles-prod/terrarium"
+        "/{z}/{x}/{y}.png"
+    )
+
+    min_lon, min_lat, max_lon, max_lat = bbox_wgs84
+    tiles = list(mercantile.tiles(min_lon, min_lat, max_lon, max_lat, zooms=zoom))
+
+    if not tiles:
+        raise RuntimeError("No Mapzen tiles found for bounding box")
+
+    log.info(f"Mapzen: downloading {len(tiles)} tiles at zoom {zoom}")
+
+    tmp_dir = output_path.parent / "_mapzen_tiles"
+    tmp_dir.mkdir(exist_ok=True)
+    tile_paths = []
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": "CourseReplicator2K/2.0"})
+
+    for tile in tiles:
+        url = TERRARIUM_URL.format(z=tile.z, x=tile.x, y=tile.y)
+        try:
+            resp = session.get(url, timeout=30)
+            if resp.status_code != 200:
+                log.debug(f"Mapzen tile {tile} returned HTTP {resp.status_code}")
+                continue
+
+            # Decode Terrarium PNG → elevation metres
+            img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+            arr = np.array(img, dtype=np.float32)
+            elevation = arr[:, :, 0] * 256.0 + arr[:, :, 1] + arr[:, :, 2] / 256.0 - 32768.0
+
+            # Sea-level clamp: water bodies sometimes encode slightly below -32768
+            elevation = np.clip(elevation, -500.0, 9000.0)
+
+            bounds = mercantile.bounds(tile)
+            tile_transform = from_bounds(
+                bounds.west, bounds.south, bounds.east, bounds.north,
+                elevation.shape[1], elevation.shape[0]
+            )
+
+            tile_path = tmp_dir / f"tile_{tile.z}_{tile.x}_{tile.y}.tif"
+            with rasterio.open(
+                tile_path, "w",
+                driver="GTiff",
+                height=elevation.shape[0],
+                width=elevation.shape[1],
+                count=1,
+                dtype="float32",
+                crs=CRS.from_epsg(4326),
+                transform=tile_transform,
+                nodata=-32768.0,
+            ) as dst:
+                dst.write(elevation[np.newaxis, :, :])
+
+            tile_paths.append(tile_path)
+
+        except Exception as e:
+            log.debug(f"Mapzen tile {tile} failed: {e}")
+            continue
+
+    if not tile_paths:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise RuntimeError("Mapzen: no tiles downloaded successfully")
+
+    # Merge all tiles into single raster
+    srcs = [rasterio.open(p) for p in tile_paths]
+    try:
+        merged_arr, merged_transform = rio_merge(srcs)
+        meta = srcs[0].meta.copy()
+        meta.update({
+            "height":    merged_arr.shape[1],
+            "width":     merged_arr.shape[2],
+            "transform": merged_transform,
+            "driver":    "GTiff",
+        })
+    finally:
+        for src in srcs:
+            src.close()
+
+    merged_path = tmp_dir / "merged.tif"
+    with rasterio.open(merged_path, "w", **meta) as dst:
+        dst.write(merged_arr)
+
+    # Clip merged raster to requested bbox
+    _clip_raster(merged_path, output_path, bbox_wgs84)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    log.info(f"Mapzen DEM written: {output_path}")
+    return True
+
+
+# ─── Source: Open-Elevation API (90m SRTM, zero-dependency last resort) ──────
 
 def _try_open_elev(bbox_wgs84: list, output_path: Path) -> bool:
     """
@@ -215,7 +419,6 @@ def _try_open_elev(bbox_wgs84: list, output_path: Path) -> bool:
     then write a synthetic GeoTIFF.
 
     Resolution: ~90m (sample at 0.001° intervals).
-    This is coarse but produces a valid raster for the pipeline.
     """
     import rasterio
     from rasterio.transform import from_bounds
@@ -299,7 +502,7 @@ def _validate_tif(path: Path) -> None:
             arr = src.read(1)
             if arr.size == 0:
                 raise ValueError("Raster is empty")
-            if np.all(arr == src.nodata):
+            if src.nodata is not None and np.all(arr == src.nodata):
                 raise ValueError("Raster is all nodata — outside coverage")
     except Exception as e:
         path.unlink(missing_ok=True)
