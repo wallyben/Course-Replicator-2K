@@ -4,14 +4,16 @@ buildpack.py — Enhanced build pack generation for Version 2.
 PART 4: Upgraded build pack generator.
 
 Outputs:
-  - heightmap.png           (from terrain.py — already generated)
-  - routing.geojson         (from routing.py)
-  - greens.geojson          (from osm_features.py)
-  - bunkers.geojson         (from osm_features.py)
-  - vegetation_zones.geojson (derived from terrain regions)
-  - course_manifest.json    (comprehensive course metadata)
-  - hole_blueprints.pdf     (per-hole reference sheets)
-  - replication_report.html (full interactive report)
+  - heightmap.png             (from terrain.py — already generated)
+  - holes.geojson             (from routing.py)
+  - greens.geojson            (from osm_features.py)
+  - bunkers.geojson           (from osm_features.py)
+  - trees.geojson             (from vision_extract.py, merged with OSM)
+  - vegetation_zones.geojson  (derived from terrain regions + course type)
+  - course_manifest.json      (comprehensive course metadata)
+  - pga2k_build_spec.json     (PGA 2K Designer structured build instructions)
+  - hole_blueprints.pdf       (per-hole reference sheets)
+  - replication_report.html   (full interactive report)
 """
 
 import json
@@ -65,7 +67,16 @@ def generate_enhanced_buildpack(
     # Gather all outputs
     outputs = {}
 
-    # 1. Vegetation zones (derived from terrain regions)
+    # 1. Trees GeoJSON — merge OSM tree nodes + vision-detected clusters
+    trees_path = output_dir / "trees.geojson"
+    try:
+        _generate_trees_geojson(output_dir, trees_path)
+        outputs["trees"] = str(trees_path)
+        log.info(f"Trees GeoJSON: {trees_path.name}")
+    except Exception as e:
+        log.warning(f"Trees GeoJSON failed (non-critical): {e}")
+
+    # 2. Vegetation zones (derived from terrain regions + course type)
     veg_path = output_dir / "vegetation_zones.geojson"
     try:
         _generate_vegetation_zones(terrain_stats, output_dir, veg_path, course_type)
@@ -87,6 +98,19 @@ def generate_enhanced_buildpack(
     manifest_path.write_text(json.dumps(manifest, indent=2))
     outputs["course_manifest"] = str(manifest_path)
     log.info("Course manifest written")
+
+    # 3b. PGA 2K structured build spec (machine-readable designer instructions)
+    spec_path = output_dir / "pga2k_build_spec.json"
+    try:
+        build_spec = _generate_pga2k_build_spec(
+            boundary_data, terrain_stats, routing_data,
+            feature_paths, output_dir
+        )
+        spec_path.write_text(json.dumps(build_spec, indent=2))
+        outputs["pga2k_build_spec"] = str(spec_path)
+        log.info(f"PGA 2K build spec: {spec_path.name}")
+    except Exception as e:
+        log.warning(f"PGA 2K build spec failed (non-critical): {e}")
 
     # 4. Hole blueprints PDF
     pdf_path = output_dir / "hole_blueprints.pdf"
@@ -117,6 +141,371 @@ def generate_enhanced_buildpack(
         "outputs":      outputs,
         "manifest":     manifest,
     }
+
+
+# ─── Trees GeoJSON ────────────────────────────────────────────────────────────
+
+def _generate_trees_geojson(output_dir: Path, out_path: Path) -> None:
+    """
+    Build trees.geojson from:
+      1. OSM natural=tree / natural=wood polygons (if present in features.geojson)
+      2. Vision-detected tree cluster polygons (vision_trees.geojson)
+
+    Deduplicates by centroid proximity (within 10m → keep only one).
+    """
+    from shapely.geometry import shape, Point, mapping
+    from shapely.ops import unary_union
+
+    tree_features = []
+
+    # Source 1: OSM features.geojson — look for wood/tree tags
+    osm_path = output_dir / "features.geojson"
+    if osm_path.exists():
+        all_feats = _load_geojson_features(osm_path)
+        for f in all_feats:
+            props = f.get("properties", {})
+            tags  = props.get("tags", {})
+            nat   = tags.get("natural", "")
+            landuse = tags.get("landuse", "")
+            if nat in ("tree", "wood", "scrub") or landuse in ("forest", "wood"):
+                f["properties"]["source"] = "osm"
+                tree_features.append(f)
+
+    # Source 2: Vision-detected tree clusters
+    vision_path = output_dir / "vision_trees.geojson"
+    if vision_path.exists():
+        vision_feats = _load_geojson_features(vision_path)
+        # Deduplicate against OSM trees by centroid proximity
+        osm_centroids = []
+        for f in tree_features:
+            if f.get("geometry"):
+                try:
+                    osm_centroids.append(shape(f["geometry"]).centroid)
+                except Exception:
+                    pass
+
+        for vf in vision_feats:
+            if not vf.get("geometry"):
+                continue
+            try:
+                vg = shape(vf["geometry"])
+                vc = vg.centroid
+                too_close = any(
+                    vc.distance(oc) < 0.0001  # ~10m in degrees
+                    for oc in osm_centroids
+                )
+                if not too_close:
+                    vf["properties"]["source"] = "vision"
+                    tree_features.append(vf)
+                    osm_centroids.append(vc)
+            except Exception:
+                continue
+
+    geojson = {"type": "FeatureCollection", "features": tree_features}
+    out_path.write_text(json.dumps(geojson, indent=2))
+    log.debug(f"trees.geojson: {len(tree_features)} features")
+
+
+# ─── PGA 2K Build Spec ────────────────────────────────────────────────────────
+
+def _generate_pga2k_build_spec(
+    boundary_data: dict,
+    terrain_stats: dict,
+    routing_data: dict,
+    feature_paths: dict,
+    output_dir: Path,
+) -> dict:
+    """
+    Generate the PGA 2K Designer structured build specification.
+
+    Output format:
+    {
+      "course_name": "...",
+      "course_type": "...",
+      "heightmap": "heightmap.png",
+      "heightmap_range": {"min_slider": 0, "max_slider": 100, "metres_per_unit": ...},
+      "canvas": {"width_yards": 1372, "height_yards": 1372},
+      "holes": [
+        {
+          "hole": 1,
+          "par": 4,
+          "length_m": 380,
+          "length_yards": 415,
+          "tee": {"lon": ..., "lat": ...},
+          "green": {"lon": ..., "lat": ...},
+          "fairway_polygon": [[lon,lat], ...],
+          "bunkers": [{"centroid": [lon,lat], "area_m2": ...}, ...],
+          "water_hazards": [...],
+          "trees": [{"centroid": [lon,lat]}, ...],
+          "build_steps": [...]
+        }
+      ],
+      "global_features": {
+        "vegetation_zones": "vegetation_zones.geojson",
+        "terrain_regions": "terrain_regions.geojson",
+        "trees": "trees.geojson"
+      }
+    }
+    """
+    from shapely.geometry import shape
+    import json as _json
+
+    course_name = boundary_data.get("name", "Unknown Course")
+    holes_raw   = routing_data.get("holes", [])
+
+    # Load per-type feature collections for spatial lookups
+    bunker_geoms   = _load_typed_geoms(output_dir, "bunkers.geojson")
+    water_geoms    = _load_typed_geoms(output_dir, "water.geojson")
+    tree_geoms     = _load_typed_geoms(output_dir, "trees.geojson")
+    fairway_geoms  = _load_typed_geoms(output_dir, "fairways.geojson")
+
+    spec_holes = []
+    for hole in holes_raw:
+        hole_num = hole.get("hole_number", 0)
+        tee      = hole.get("tee_position") or hole.get("tee_centroid")
+        green    = hole.get("green_position") or hole.get("green_centroid")
+
+        tee_coord   = _pos_to_coord(tee)
+        green_coord = _pos_to_coord(green)
+
+        # Corridor for spatial lookups (~40m half-width in degrees)
+        corridor = _build_corridor(tee_coord, green_coord)
+
+        # Find features near this hole
+        nearby_bunkers = _features_near_corridor(bunker_geoms, corridor)
+        nearby_water   = _features_near_corridor(water_geoms,  corridor)
+        nearby_trees   = _features_near_corridor(tree_geoms,   corridor)
+        fairway_poly   = _find_matching_fairway(fairway_geoms, corridor)
+
+        length_m     = hole.get("distance_m") or hole.get("length_m") or 0
+        length_yards = hole.get("distance_yards") or hole.get("length_yards") or round(length_m * 1.09361)
+        par          = hole.get("par") or _estimate_par_from_metres(length_m)
+
+        spec_holes.append({
+            "hole":         hole_num,
+            "par":          par,
+            "length_m":     round(length_m, 1) if length_m else None,
+            "length_yards": int(round(length_yards)) if length_yards else None,
+            "tee":          tee_coord,
+            "green":        green_coord,
+            "fairway_polygon": fairway_poly,
+            "bunkers":      nearby_bunkers,
+            "water_hazards": nearby_water,
+            "trees":        nearby_trees,
+            "build_steps":  _pga2k_build_steps(
+                hole_num, par, length_yards, tee_coord, green_coord,
+                len(nearby_bunkers), len(nearby_water), terrain_stats
+            ),
+        })
+
+    # Heightmap mapping
+    hm_file = feature_paths.get("heightmap_png") or "heightmap.png"
+    tk2 = {
+        "min_slider":     terrain_stats.get("tk2_height_at_z_min", 0),
+        "max_slider":     terrain_stats.get("tk2_height_at_z_max", 100),
+        "metres_per_unit": round(
+            1.0 / max(terrain_stats.get("tk2_height_per_metre", 1.0), 0.001), 3
+        ),
+        "real_min_m":     terrain_stats.get("z_min_m", 0),
+        "real_max_m":     terrain_stats.get("z_max_m", 100),
+    }
+
+    build_spec = {
+        "schema_version":  "2.0",
+        "course_name":     course_name,
+        "centre":          boundary_data.get("centre_wgs84"),
+        "heightmap":       hm_file,
+        "heightmap_range": tk2,
+        "canvas": {
+            "width_yards":  config.TK2_CANVAS_YARDS,
+            "height_yards": config.TK2_CANVAS_YARDS,
+        },
+        "holes": spec_holes,
+        "global_features": {
+            "vegetation_zones": "vegetation_zones.geojson",
+            "terrain_regions":  "terrain_regions.geojson",
+            "trees":            "trees.geojson",
+            "slope_map":        "slope_map.png",
+        },
+        "terrain_summary": {
+            "relief_m":       terrain_stats.get("z_range_m"),
+            "slope_mean_deg": terrain_stats.get("slope_mean_deg"),
+            "flat_pct":       terrain_stats.get("flat_pct"),
+            "steep_pct":      terrain_stats.get("steep_pct"),
+        },
+    }
+    return build_spec
+
+
+def _pga2k_build_steps(
+    hole_num: int,
+    par: Optional[int],
+    length_yards,
+    tee: Optional[dict],
+    green: Optional[dict],
+    n_bunkers: int,
+    n_water: int,
+    terrain_stats: dict,
+) -> List[str]:
+    """
+    Generate ordered PGA 2K Designer build steps for one hole.
+    """
+    par_str    = f"Par {par}" if par else "Par ?"
+    yards_str  = f"{int(round(length_yards))}y" if length_yards else "? yards"
+    relief     = terrain_stats.get("z_range_m", 0)
+    relief_str = f"{relief:.1f}m total relief"
+
+    steps = [
+        f"[TERRAIN] Set heightmap reference — {relief_str}. "
+        f"Import heightmap.png via terrain editor.",
+        f"[TERRAIN] Sculpt hole corridor using slope_map.png as reference.",
+        f"[FAIRWAY] Paint fairway surface — {yards_str} from tee to green.",
+    ]
+
+    if tee:
+        steps.append(
+            f"[TEE] Place tee boxes at ({tee['lon']:.5f}, {tee['lat']:.5f}). "
+            f"Use championship tee as primary."
+        )
+
+    if green:
+        steps.append(
+            f"[GREEN] Place and sculpt putting green at ({green['lon']:.5f}, {green['lat']:.5f}). "
+            f"Reference greens.geojson for shape/orientation."
+        )
+
+    if n_bunkers > 0:
+        steps.append(
+            f"[BUNKERS] Place {n_bunkers} bunker(s). "
+            f"Reference bunkers.geojson for exact positions."
+        )
+
+    if n_water > 0:
+        steps.append(
+            f"[WATER] Place {n_water} water hazard(s). "
+            f"Reference water.geojson for shape."
+        )
+
+    steps += [
+        f"[ROUGH] Paint rough zones around fairway (2–3 painter brush passes).",
+        f"[VEGETATION] Place trees per trees.geojson and vegetation_zones.geojson.",
+        f"[QA] Walk the hole. Verify {yards_str} from championship tee. "
+        f"Check pin position and approach angles.",
+    ]
+
+    return steps
+
+
+# ─── Spatial helpers ──────────────────────────────────────────────────────────
+
+def _load_typed_geoms(output_dir: Path, filename: str) -> list:
+    """Load GeoJSON features as (shapely_geom, properties) tuples."""
+    from shapely.geometry import shape
+    path = output_dir / filename
+    feats = []
+    if path.exists():
+        for f in _load_geojson_features(path):
+            if f.get("geometry"):
+                try:
+                    feats.append((shape(f["geometry"]), f.get("properties", {})))
+                except Exception:
+                    pass
+    return feats
+
+
+def _build_corridor(
+    tee: Optional[dict], green: Optional[dict], half_width_deg: float = 0.0004
+) -> Optional[object]:
+    """Build a buffered corridor polygon between tee and green."""
+    from shapely.geometry import LineString, Point
+    if tee and green:
+        line = LineString([
+            (tee["lon"], tee["lat"]),
+            (green["lon"], green["lat"]),
+        ])
+        return line.buffer(half_width_deg)
+    elif tee:
+        return Point(tee["lon"], tee["lat"]).buffer(half_width_deg * 5)
+    elif green:
+        return Point(green["lon"], green["lat"]).buffer(half_width_deg * 5)
+    return None
+
+
+def _features_near_corridor(geoms: list, corridor) -> list:
+    """Return serialisable dicts for features intersecting the corridor."""
+    if corridor is None:
+        return []
+    results = []
+    for geom, props in geoms:
+        try:
+            if corridor.intersects(geom):
+                c = geom.centroid
+                results.append({
+                    "centroid": {"lon": round(c.x, 6), "lat": round(c.y, 6)},
+                    "area_m2":  props.get("area_m2"),
+                    "osm_id":   props.get("osm_id"),
+                    "source":   props.get("source", "osm"),
+                })
+        except Exception:
+            pass
+    return results
+
+
+def _find_matching_fairway(fairway_geoms: list, corridor) -> Optional[List]:
+    """Return the coordinates of the best-matching fairway polygon."""
+    from shapely.geometry import mapping
+    if corridor is None or not fairway_geoms:
+        return None
+    best, best_area = None, 0.0
+    for geom, props in fairway_geoms:
+        try:
+            if corridor.intersects(geom):
+                inter = corridor.intersection(geom).area
+                if inter > best_area:
+                    best_area = inter
+                    best = geom
+        except Exception:
+            pass
+    if best is None:
+        return None
+    # Return as flat coordinate list [[lon,lat], ...]
+    try:
+        coords = list(best.exterior.coords) if best.geom_type == "Polygon" else []
+        return [[round(x, 6), round(y, 6)] for x, y in coords]
+    except Exception:
+        return None
+
+
+def _pos_to_coord(pos) -> Optional[dict]:
+    """Normalise tee/green position to {lon, lat} dict."""
+    if pos is None:
+        return None
+    if isinstance(pos, dict):
+        lon = pos.get("lon") or pos.get("longitude")
+        lat = pos.get("lat") or pos.get("latitude")
+        if lon is not None and lat is not None:
+            return {"lon": round(float(lon), 6), "lat": round(float(lat), 6)}
+    if isinstance(pos, (list, tuple)) and len(pos) >= 2:
+        return {"lon": round(float(pos[0]), 6), "lat": round(float(pos[1]), 6)}
+    return None
+
+
+def _estimate_par_from_metres(distance_m: float) -> int:
+    yards = distance_m * 1.09361 if distance_m else 0
+    if yards < 250:
+        return 3
+    elif yards < 470:
+        return 4
+    return 5
+
+
+def _load_geojson_features(path: Path) -> list:
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text()).get("features", [])
+    except Exception:
+        return []
 
 
 # ─── Vegetation zones ─────────────────────────────────────────────────────────

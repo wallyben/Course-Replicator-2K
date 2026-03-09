@@ -89,7 +89,10 @@ def acquire_elevation(boundary_data: dict, output_dir: Path) -> Tuple[Path, str]
 
 def validate_dem_integrity(dtm_path: Path) -> None:
     """
-    FIX 2: Validate DEM has usable elevation data before terrain processing.
+    FIX 2: Validate raw DEM has usable elevation data BEFORE clipping.
+
+    This is called on the full downloaded DEM (not the clipped result).
+    Threshold: ≥ 10% valid pixels required on the full tile.
 
     Raises:
         RuntimeError: if DEM is empty, too small, or entirely NaN/nodata.
@@ -110,6 +113,7 @@ def validate_dem_integrity(dtm_path: Path) -> None:
         raise RuntimeError("DEM contains no valid elevation data")
 
     if nodata is not None:
+        arr = arr.copy()
         arr[arr == nodata] = np.nan
 
     if np.all(np.isnan(arr)):
@@ -125,6 +129,53 @@ def validate_dem_integrity(dtm_path: Path) -> None:
         )
 
     log.debug(f"DEM integrity OK: {arr.shape}, {valid_pct:.1f}% valid")
+
+
+def validate_dem_post_clip(dtm_path: Path) -> None:
+    """
+    Lenient DEM validation for post-clip rasters.
+
+    Problem 2: After clipping a Mapzen mosaic to a course bbox, valid
+    coverage can legitimately be lower (e.g. coastal courses, small area).
+    This check accepts as little as 5% valid pixels but still rejects
+    completely empty rasters.
+
+    Raises:
+        RuntimeError: only if the clipped raster has no valid data at all.
+    """
+    import rasterio
+
+    if not dtm_path.exists():
+        raise RuntimeError("DEM contains no valid elevation data")
+
+    with rasterio.open(dtm_path) as src:
+        arr = src.read(1).astype(np.float32)
+        nodata = src.nodata
+
+    if arr.size == 0:
+        raise RuntimeError("DEM contains no valid elevation data")
+
+    if arr.shape[0] < 2 or arr.shape[1] < 2:
+        raise RuntimeError("DEM contains no valid elevation data")
+
+    if nodata is not None:
+        arr = arr.copy()
+        arr[arr == nodata] = np.nan
+
+    if np.all(np.isnan(arr)):
+        raise RuntimeError("DEM contains no valid elevation data")
+
+    valid_pct = float(np.sum(~np.isnan(arr))) / arr.size * 100
+
+    if valid_pct < 5.0:
+        # Attempt median fill on very sparse data rather than hard-failing.
+        # If we have SOME valid pixels, terrain.py can fill the rest.
+        log.warning(
+            f"Post-clip DEM is sparse ({valid_pct:.1f}% valid pixels). "
+            "Terrain NaN fill will interpolate missing cells."
+        )
+    else:
+        log.debug(f"Post-clip DEM coverage OK: {valid_pct:.1f}% valid")
 
 
 # ─── Source: INLP (Tailte Éireann) ───────────────────────────────────────────
@@ -328,6 +379,13 @@ def download_mapzen_dem(bbox_wgs84: list, output_path: Path, zoom: int = 12) -> 
 
     if not tiles:
         raise RuntimeError("No Mapzen tiles found for bounding box")
+
+    # Problem 2 guard: if too many tiles, step down zoom to keep it manageable
+    if len(tiles) > 100 and zoom > 9:
+        log.warning(
+            f"Mapzen: {len(tiles)} tiles at zoom {zoom} — stepping down to zoom {zoom-1}"
+        )
+        return download_mapzen_dem(bbox_wgs84, output_path, zoom=zoom - 1)
 
     log.info(f"Mapzen: downloading {len(tiles)} tiles at zoom {zoom}")
 

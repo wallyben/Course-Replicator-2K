@@ -1,17 +1,23 @@
 """
 vision_extract.py — Satellite imagery feature detection via computer vision.
 
-UPGRADE 3: Detect golf features missing from OSM using satellite imagery.
+UPGRADE 3 (V2.1): Detect golf features missing from OSM using satellite imagery.
 
-Method:
-  1. Download satellite image tiles (OpenStreetMap tile server)
-  2. Convert to HSV colour space
-  3. Segment fairways via green-band analysis
-  4. Detect bunkers via sand colour clustering
-  5. Detect greens via low-texture circular patch detection
+Tile sources (in priority order):
+  1. Bing Maps aerial tiles (best resolution for Ireland/UK)
+  2. ESRI World Imagery tiles (global fallback)
+  3. OpenStreetMap standard tiles (no satellite — last resort)
 
-Libraries: opencv-python, scikit-image, numpy
-Output: Merges detections with OSM geometry (supplementary GeoJSON)
+Detection targets:
+  - fairways    (bright green elongated shapes)
+  - greens      (small circular uniform patches)
+  - bunkers     (light sand-coloured irregular shapes)
+  - water       (dark blue/grey regions)
+  - trees       (dark textured green clusters)
+  - rough       (medium-texture yellowy-green zones)
+
+Libraries: opencv-python, scikit-image, numpy, Pillow, mercantile
+Output:    GeoJSON per feature type + debug composite image
 """
 
 import json
@@ -29,34 +35,82 @@ import config
 log = logging.getLogger(__name__)
 
 
-# ─── Colour thresholds (HSV) ──────────────────────────────────────────────────
+# ─── Satellite tile sources ───────────────────────────────────────────────────
 
-# Fairway green: medium-dark green turf
-FAIRWAY_HSV = {
-    "h_min": 35, "h_max": 90,    # green hue range
-    "s_min": 40, "s_max": 255,   # saturated
-    "v_min": 40, "v_max": 200,   # not too dark/bright
+TILE_SOURCES = [
+    # Bing Aerial — high quality for Ireland/UK; no key for basic usage
+    {
+        "name":     "Bing",
+        "url":      "https://t.ssl.ak.dynamic.tiles.virtualearth.net/comp/ch/{quadkey}?mkt=en-IE&it=A&shading=hill&og=2177&n=z",
+        "type":     "quadkey",
+        "max_zoom": 19,
+    },
+    # ESRI World Imagery — global, no key required
+    {
+        "name":  "ESRI",
+        "url":   "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        "type":  "xyz",
+        "max_zoom": 18,
+    },
+    # Stamen/CARTO topo (no satellite, last resort for terrain context only)
+    {
+        "name":  "OSM",
+        "url":   "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        "type":  "xyz",
+        "max_zoom": 19,
+    },
+]
+
+
+# ─── HSV colour thresholds (OpenCV: H 0-179, S 0-255, V 0-255) ───────────────
+
+THRESHOLDS = {
+    "fairway": {
+        "h": (35, 85),   # green-yellow hue
+        "s": (40, 220),  # moderately saturated
+        "v": (50, 200),  # not too dark, not bleached
+        "min_area_px": 400,
+        "texture_max": 35,   # fairways are uniform
+    },
+    "green": {
+        "h": (38, 82),   # brighter green
+        "s": (50, 210),
+        "v": (60, 195),
+        "min_area_px": 60,
+        "max_area_px": 700,
+        "circularity_min": 0.38,  # putting greens are roundish
+        "texture_max": 30,        # very uniform surface
+    },
+    "bunker": {
+        "h": (14, 42),   # pale yellow → beige → tan
+        "s": (15, 110),  # low saturation (sand)
+        "v": (155, 255), # bright (sand reflects light)
+        "min_area_px": 20,
+        "max_area_px": 1500,
+    },
+    "water": {
+        "h": (90, 140),  # blue-cyan
+        "s": (30, 230),
+        "v": (0, 140),   # water is typically dark
+        "min_area_px": 50,
+        # Also catch very dark regions (deep shadow / dark water)
+        "dark_v_max": 45,   # if V < 45 and H in range, always water
+    },
+    "trees": {
+        "h": (30, 85),   # green hues
+        "s": (25, 200),
+        "v": (15, 110),  # dark — trees absorb light
+        "min_area_px": 100,
+        "texture_min": 28,   # trees are textured (unlike smooth fairways)
+    },
+    "rough": {
+        "h": (28, 88),   # broad green range
+        "s": (20, 180),
+        "v": (40, 160),
+        "min_area_px": 300,
+        "texture_range": (12, 45),  # medium texture (not as smooth as fairway)
+    },
 }
-
-# Bunker sand: pale yellow/beige
-BUNKER_HSV = {
-    "h_min": 15, "h_max": 40,
-    "s_min": 20, "s_max": 120,
-    "v_min": 160, "v_max": 255,
-}
-
-# Green (putting green): similar to fairway but smaller and more uniform
-GREEN_HSV = {
-    "h_min": 40, "h_max": 80,
-    "s_min": 50, "s_max": 200,
-    "v_min": 60, "v_max": 180,
-}
-
-# Minimum pixel areas for detection (at zoom 17, ~1.2m/px)
-MIN_FAIRWAY_PX  = 500
-MIN_BUNKER_PX   = 30
-MIN_GREEN_PX    = 100
-MAX_GREEN_PX    = 800   # greens are small
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
@@ -75,69 +129,63 @@ def detect_features(
         zoom:        Tile zoom level (17 ≈ 1.2m/px, 16 ≈ 2.4m/px)
 
     Returns:
-        Detection summary dict with detected feature GeoJSON paths.
+        Detection summary dict.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     log.info(f"Vision extraction: bbox={bbox_wgs84}, zoom={zoom}")
 
-    # Step 1: Download and stitch satellite tiles
+    # Step 1: Download satellite mosaic
     try:
-        img_arr, img_transform, img_crs = _download_satellite_mosaic(
-            bbox_wgs84, zoom, output_dir
-        )
+        img_arr, transform_params = _download_satellite_mosaic(bbox_wgs84, zoom, output_dir)
     except Exception as e:
-        log.warning(f"Satellite tile download failed: {e}. Skipping vision extraction.")
+        log.warning(f"Satellite tile download failed: {e}")
         return {"error": str(e), "detections": {}}
 
     if img_arr is None:
-        log.warning("No satellite tiles available — skipping vision extraction")
         return {"detections": {}}
 
     log.info(f"Satellite mosaic: {img_arr.shape[1]}×{img_arr.shape[0]}px")
 
-    # Step 2: Run CV detections
-    detections = {}
-
+    # Save mosaic for reference
     try:
-        fairway_polys = _detect_fairways(img_arr)
-        fairway_path = output_dir / "vision_fairways.geojson"
-        _save_detections_geojson(
-            fairway_polys, img_transform, "fairway", fairway_path
-        )
-        detections["fairway"] = {"count": len(fairway_polys), "path": str(fairway_path)}
-        log.info(f"Vision: {len(fairway_polys)} fairway regions detected")
-    except Exception as e:
-        log.warning(f"Fairway detection failed: {e}")
-
-    try:
-        bunker_polys = _detect_bunkers(img_arr)
-        bunker_path = output_dir / "vision_bunkers.geojson"
-        _save_detections_geojson(
-            bunker_polys, img_transform, "bunker", bunker_path
-        )
-        detections["bunker"] = {"count": len(bunker_polys), "path": str(bunker_path)}
-        log.info(f"Vision: {len(bunker_polys)} bunker regions detected")
-    except Exception as e:
-        log.warning(f"Bunker detection failed: {e}")
-
-    try:
-        green_polys = _detect_greens(img_arr)
-        green_path = output_dir / "vision_greens.geojson"
-        _save_detections_geojson(
-            green_polys, img_transform, "green", green_path
-        )
-        detections["green"] = {"count": len(green_polys), "path": str(green_path)}
-        log.info(f"Vision: {len(green_polys)} putting green candidates detected")
-    except Exception as e:
-        log.warning(f"Green detection failed: {e}")
-
-    # Save debug composite
-    try:
-        _save_debug_image(img_arr, output_dir / "vision_debug.jpg")
+        _save_debug_image(img_arr, output_dir / "satellite_mosaic.jpg")
     except Exception:
         pass
+
+    # Step 2: Run all detectors
+    detections = {}
+    detection_fns = [
+        ("fairway", _detect_fairways),
+        ("green",   _detect_greens),
+        ("bunker",  _detect_bunkers),
+        ("water",   _detect_water),
+        ("trees",   _detect_trees),
+        ("rough",   _detect_rough),
+    ]
+
+    all_masks = {}  # for debug overlay
+
+    for feat_type, fn in detection_fns:
+        try:
+            contours, mask = fn(img_arr)
+            all_masks[feat_type] = mask
+            out_path = output_dir / f"vision_{feat_type}s.geojson"
+            _save_detections_geojson(contours, transform_params, feat_type, out_path)
+            detections[feat_type] = {
+                "count": len(contours),
+                "path":  str(out_path),
+            }
+            log.info(f"Vision [{feat_type}]: {len(contours)} regions")
+        except Exception as e:
+            log.warning(f"Vision [{feat_type}] detection failed: {e}")
+
+    # Step 3: Save debug overlay with all detections coloured
+    try:
+        _save_detection_overlay(img_arr, all_masks, output_dir / "vision_overlay.jpg")
+    except Exception as e:
+        log.debug(f"Overlay save failed: {e}")
 
     summary = {
         "zoom":       zoom,
@@ -151,27 +199,29 @@ def detect_features(
 def merge_vision_with_osm(
     vision_summary: dict,
     osm_output_dir: Path,
-    min_iou_threshold: float = 0.3,
+    min_iou_threshold: float = 0.25,
 ) -> dict:
     """
-    Merge vision detections with OSM features.
-    Adds vision-detected features that have low IoU overlap with existing OSM features.
-
-    Args:
-        vision_summary:   Output of detect_features()
-        osm_output_dir:   Directory containing OSM GeoJSON files
-        min_iou_threshold: Features with IoU above this threshold are duplicates
-
-    Returns:
-        Merge statistics dict.
+    Merge vision detections with existing OSM GeoJSON features.
+    Adds vision features that have low IoU overlap with OSM features.
     """
     from shapely.geometry import shape
     from shapely.ops import unary_union
 
     stats = {}
+    feat_type_to_file = {
+        "fairway": "fairways.geojson",
+        "green":   "greens.geojson",
+        "bunker":  "bunkers.geojson",
+        "water":   "water.geojson",
+        "trees":   "trees.geojson",
+        "rough":   "rough.geojson",
+    }
+
     for feat_type, det_info in vision_summary.get("detections", {}).items():
         vision_path = Path(det_info.get("path", ""))
-        osm_path = osm_output_dir / f"{feat_type}s.geojson"
+        osm_filename = feat_type_to_file.get(feat_type, f"{feat_type}s.geojson")
+        osm_path = osm_output_dir / osm_filename
 
         if not vision_path.exists():
             continue
@@ -179,35 +229,41 @@ def merge_vision_with_osm(
         vision_feats = _load_geojson(vision_path)
         osm_feats = _load_geojson(osm_path) if osm_path.exists() else []
 
-        osm_geoms = [shape(f["geometry"]) for f in osm_feats if f.get("geometry")]
+        osm_geoms = []
+        for f in osm_feats:
+            if f.get("geometry"):
+                try:
+                    osm_geoms.append(shape(f["geometry"]))
+                except Exception:
+                    pass
         osm_union = unary_union(osm_geoms) if osm_geoms else None
 
         added = []
         for vf in vision_feats:
             if not vf.get("geometry"):
                 continue
-            vg = shape(vf["geometry"])
+            try:
+                vg = shape(vf["geometry"])
+            except Exception:
+                continue
             if osm_union is None or not osm_union.intersects(vg):
                 vf["properties"]["source"] = "vision"
                 added.append(vf)
             else:
-                inter = osm_union.intersection(vg)
-                iou = inter.area / (osm_union.area + vg.area - inter.area)
-                if iou < min_iou_threshold:
-                    vf["properties"]["source"] = "vision"
-                    added.append(vf)
+                try:
+                    inter_area = osm_union.intersection(vg).area
+                    union_area = osm_union.area + vg.area - inter_area
+                    iou = inter_area / max(union_area, 1e-10)
+                    if iou < min_iou_threshold:
+                        vf["properties"]["source"] = "vision"
+                        added.append(vf)
+                except Exception:
+                    pass
 
-        if added and osm_path.exists():
-            existing = _load_geojson(osm_path)
-            merged = existing + added
-            osm_path.write_text(json.dumps(
-                {"type": "FeatureCollection", "features": merged}, indent=2
-            ))
-            log.info(f"Vision merge: added {len(added)} {feat_type}(s) to {osm_path.name}")
-        elif added:
-            osm_path.write_text(json.dumps(
-                {"type": "FeatureCollection", "features": added}, indent=2
-            ))
+        if added:
+            merged = osm_feats + added
+            _write_geojson_features(merged, osm_path)
+            log.info(f"Vision merge: +{len(added)} {feat_type}(s) → {osm_path.name}")
 
         stats[feat_type] = len(added)
 
@@ -220,14 +276,12 @@ def _download_satellite_mosaic(
     bbox_wgs84: list,
     zoom: int,
     output_dir: Path,
-) -> Tuple[Optional[np.ndarray], object, str]:
+) -> Tuple[Optional[np.ndarray], Optional[tuple]]:
     """
-    Download and stitch satellite tiles into a single mosaic.
-    Uses OpenStreetMap tile server (imagery from ESRI/Mapbox).
+    Download and stitch satellite tiles.
 
-    Returns:
-        (rgb_array [H,W,3], affine_transform, crs_epsg_str)
-        or (None, None, None) on failure
+    Tries TILE_SOURCES in order. Returns (rgb_array, transform_params) or (None, None).
+    transform_params: (west_lon, north_lat, lon_per_px, lat_per_px)
     """
     try:
         import mercantile
@@ -235,215 +289,322 @@ def _download_satellite_mosaic(
         import io as _io
         import requests
     except ImportError as e:
-        raise RuntimeError(f"Missing dependency: {e}. Install mercantile, Pillow")
+        raise RuntimeError(f"Missing dependency: {e}")
 
     min_lon, min_lat, max_lon, max_lat = bbox_wgs84
-
-    # Use ESRI World Imagery tiles (free, no key required for reasonable usage)
-    TILE_URLS = [
-        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        "https://tile.openstreetmap.org/{z}/{x}/{y}.png",   # fallback (no satellite)
-    ]
-
     tiles = list(mercantile.tiles(min_lon, min_lat, max_lon, max_lat, zooms=zoom))
-    if not tiles:
-        return None, None, None
-    if len(tiles) > 64:
-        log.warning(f"Too many tiles ({len(tiles)}) at zoom {zoom}, clamping to zoom {zoom-1}")
+
+    # Auto step-down if tile count is unmanageable
+    if len(tiles) > 64 and zoom > 13:
+        log.info(f"Too many tiles ({len(tiles)}) at zoom {zoom} — stepping down")
         return _download_satellite_mosaic(bbox_wgs84, zoom - 1, output_dir)
+
+    if not tiles:
+        return None, None
 
     log.info(f"Downloading {len(tiles)} satellite tiles at zoom {zoom}")
 
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "CourseReplicator2K/2.0 (geospatial research)"
+        "User-Agent": "CourseReplicator2K/2.0 (research)",
+        "Referer":    "https://github.com/",
     })
 
-    tile_images = {}   # (x, y) → PIL Image
-    tile_url_template = TILE_URLS[0]
+    # Try each tile source in order
+    for source in TILE_SOURCES:
+        tile_images = _fetch_tiles_from_source(source, tiles, session)
+        if len(tile_images) >= max(1, len(tiles) // 2):
+            log.info(f"Using tile source: {source['name']} ({len(tile_images)}/{len(tiles)} tiles)")
+            break
+    else:
+        return None, None
 
-    for tile in tiles:
-        url = tile_url_template.format(z=tile.z, x=tile.x, y=tile.y)
-        try:
-            resp = session.get(url, timeout=15)
-            if resp.status_code == 200:
-                img = Image.open(_io.BytesIO(resp.content)).convert("RGB")
-                tile_images[(tile.x, tile.y)] = (img, tile)
-            else:
-                log.debug(f"Tile {tile} HTTP {resp.status_code}")
-        except Exception as e:
-            log.debug(f"Tile {tile} failed: {e}")
-
-    if not tile_images:
-        return None, None, None
-
-    # Determine grid extent
-    all_tiles = [t for _, (_, t) in tile_images.items()]
-    x_coords = [t.x for t in all_tiles]
-    y_coords = [t.y for t in all_tiles]
+    # Stitch mosaic
+    all_tile_objs = [t for _, t in tile_images.values()]
+    x_coords = [t.x for t in all_tile_objs]
+    y_coords = [t.y for t in all_tile_objs]
     min_tx, max_tx = min(x_coords), max(x_coords)
     min_ty, max_ty = min(y_coords), max(y_coords)
 
-    tile_w = 256
-    tile_h = 256
-    grid_w = (max_tx - min_tx + 1) * tile_w
-    grid_h = (max_ty - min_ty + 1) * tile_h
-
-    mosaic = Image.new("RGB", (grid_w, grid_h), color=(128, 128, 128))
+    tw, th = 256, 256
+    grid_w = (max_tx - min_tx + 1) * tw
+    grid_h = (max_ty - min_ty + 1) * th
+    mosaic = Image.new("RGB", (grid_w, grid_h), color=(100, 100, 100))
 
     for (tx, ty), (img, tile) in tile_images.items():
-        px = (tx - min_tx) * tile_w
-        py = (ty - min_ty) * tile_h
+        px = (tx - min_tx) * tw
+        py = (ty - min_ty) * th
         mosaic.paste(img, (px, py))
 
-    # Compute affine transform
-    ul_tile = mercantile.Tile(min_tx, min_ty, zoom)
-    ul_bounds = mercantile.bounds(ul_tile)
-    lr_tile = mercantile.Tile(max_tx, max_ty, zoom)
-    lr_bounds = mercantile.bounds(lr_tile)
-
+    # Compute geographic transform
+    ul_bounds = mercantile.bounds(mercantile.Tile(min_tx, min_ty, zoom))
+    lr_bounds = mercantile.bounds(mercantile.Tile(max_tx, max_ty, zoom))
     total_west  = ul_bounds.west
     total_north = ul_bounds.north
-    total_east  = lr_bounds.east
-    total_south = lr_bounds.south
-
-    lon_per_px = (total_east - total_west) / grid_w
-    lat_per_px = (total_north - total_south) / grid_h
-
-    # Simple affine: [lon_per_px, 0, west, 0, -lat_per_px, north]
-    # Store as tuple for use in _pixel_to_wgs84
+    lon_per_px  = (lr_bounds.east  - ul_bounds.west)  / grid_w
+    lat_per_px  = (ul_bounds.north - lr_bounds.south) / grid_h
     transform_params = (total_west, total_north, lon_per_px, lat_per_px)
 
-    arr = np.array(mosaic, dtype=np.uint8)
-    return arr, transform_params, "EPSG:4326"
+    return np.array(mosaic, dtype=np.uint8), transform_params
 
 
-# ─── Feature detection algorithms ────────────────────────────────────────────
-
-def _detect_fairways(img_rgb: np.ndarray) -> List[dict]:
+def _fetch_tiles_from_source(source: dict, tiles: list, session) -> dict:
     """
-    Detect fairway regions using HSV green segmentation.
-    Returns list of pixel contour dicts.
+    Fetch tiles from one source definition.
+    Returns dict: (tx, ty) → (PIL.Image, mercantile.Tile)
     """
+    from PIL import Image
+    import io as _io
+
+    results = {}
+    url_template = source["url"]
+    source_type  = source["type"]
+
+    for tile in tiles:
+        try:
+            if source_type == "quadkey":
+                qk = _tile_to_quadkey(tile.x, tile.y, tile.z)
+                url = url_template.format(quadkey=qk)
+            else:
+                url = url_template.format(z=tile.z, x=tile.x, y=tile.y)
+
+            resp = session.get(url, timeout=12)
+            if resp.status_code != 200:
+                continue
+
+            ct = resp.headers.get("Content-Type", "")
+            if "image" not in ct and "octet" not in ct:
+                continue
+
+            img = Image.open(_io.BytesIO(resp.content)).convert("RGB")
+            results[(tile.x, tile.y)] = (img, tile)
+
+        except Exception as e:
+            log.debug(f"Tile {tile} from {source['name']} failed: {e}")
+            continue
+
+    return results
+
+
+def _tile_to_quadkey(x: int, y: int, z: int) -> str:
+    """Convert tile (x, y, z) to Bing Maps quadkey string."""
+    quadkey = []
+    for i in range(z, 0, -1):
+        digit = 0
+        mask = 1 << (i - 1)
+        if x & mask:
+            digit += 1
+        if y & mask:
+            digit += 2
+        quadkey.append(str(digit))
+    return "".join(quadkey)
+
+
+# ─── Feature detectors ────────────────────────────────────────────────────────
+
+def _get_cv2():
+    """Import cv2 with a helpful error message."""
     try:
         import cv2
+        return cv2
     except ImportError:
-        raise RuntimeError("opencv-python required for vision extraction")
+        raise RuntimeError(
+            "opencv-python is required for vision extraction. "
+            "Install with: pip install opencv-python"
+        )
 
+
+def _hsv_mask(img_rgb: np.ndarray, h_range, s_range, v_range) -> np.ndarray:
+    """Create a binary mask from HSV threshold ranges."""
+    cv2 = _get_cv2()
     hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+    lo = np.array([h_range[0], s_range[0], v_range[0]], dtype=np.uint8)
+    hi = np.array([h_range[1], s_range[1], v_range[1]], dtype=np.uint8)
+    return cv2.inRange(hsv, lo, hi)
 
-    lower = np.array([FAIRWAY_HSV["h_min"], FAIRWAY_HSV["s_min"], FAIRWAY_HSV["v_min"]])
-    upper = np.array([FAIRWAY_HSV["h_max"], FAIRWAY_HSV["s_max"], FAIRWAY_HSV["v_max"]])
-    mask = cv2.inRange(hsv, lower, upper)
 
-    # Morphological cleanup
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+def _local_texture(img_rgb: np.ndarray, kernel: int = 7) -> np.ndarray:
+    """
+    Compute local texture as standard deviation of V channel.
+    High stddev = textured (trees, rough); low stddev = uniform (fairway, green).
+    """
+    cv2 = _get_cv2()
+    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+    v   = hsv[:, :, 2].astype(np.float32)
+    # Local std via morphological approximation
+    v_blur = cv2.blur(v, (kernel, kernel))
+    v_sq   = cv2.blur(v ** 2, (kernel, kernel))
+    variance = np.maximum(v_sq - v_blur ** 2, 0)
+    return np.sqrt(variance)
+
+
+def _morph_clean(mask: np.ndarray, open_k: int = 5, close_k: int = 7) -> np.ndarray:
+    """Apply morphological open (remove noise) then close (fill gaps)."""
+    cv2 = _get_cv2()
+    k_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k,  open_k))
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k_open,  iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close, iterations=2)
+    return mask
+
+
+def _detect_fairways(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
+    """
+    Detect fairway regions: bright green, elongated, uniform texture.
+    """
+    cv2 = _get_cv2()
+    t = THRESHOLDS["fairway"]
+
+    mask = _hsv_mask(img_rgb, t["h"], t["s"], t["v"])
+    texture = _local_texture(img_rgb)
+    # Fairways are smooth — exclude high-texture areas (trees/rough)
+    mask[texture > t["texture_max"]] = 0
+    mask = _morph_clean(mask, open_k=7, close_k=9)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    return [c for c in contours if cv2.contourArea(c) >= MIN_FAIRWAY_PX]
+    valid = [c for c in contours if cv2.contourArea(c) >= t["min_area_px"]]
+    return valid, mask
 
 
-def _detect_bunkers(img_rgb: np.ndarray) -> List[dict]:
+def _detect_greens(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
     """
-    Detect bunker regions using sand-colour HSV segmentation.
+    Detect putting greens: small, circular, very uniform green patches.
+    Uses combined HSV mask + circularity + texture filters.
     """
-    try:
-        import cv2
-    except ImportError:
-        raise RuntimeError("opencv-python required for vision extraction")
+    cv2 = _get_cv2()
+    t = THRESHOLDS["green"]
 
-    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
-
-    lower = np.array([BUNKER_HSV["h_min"], BUNKER_HSV["s_min"], BUNKER_HSV["v_min"]])
-    upper = np.array([BUNKER_HSV["h_max"], BUNKER_HSV["s_max"], BUNKER_HSV["v_max"]])
-    mask = cv2.inRange(hsv, lower, upper)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    return [c for c in contours if cv2.contourArea(c) >= MIN_BUNKER_PX]
-
-
-def _detect_greens(img_rgb: np.ndarray) -> List[dict]:
-    """
-    Detect putting greens as small, compact, low-texture green patches.
-    Uses: HSV green mask + circularity filter + texture analysis.
-    """
-    try:
-        import cv2
-    except ImportError:
-        raise RuntimeError("opencv-python required for vision extraction")
-
-    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
-
-    lower = np.array([GREEN_HSV["h_min"], GREEN_HSV["s_min"], GREEN_HSV["v_min"]])
-    upper = np.array([GREEN_HSV["h_max"], GREEN_HSV["s_max"], GREEN_HSV["v_max"]])
-    mask = cv2.inRange(hsv, lower, upper)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = _hsv_mask(img_rgb, t["h"], t["s"], t["v"])
+    texture = _local_texture(img_rgb)
+    mask[texture > t["texture_max"]] = 0
+    mask = _morph_clean(mask, open_k=3, close_k=5)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    green_candidates = []
+    candidates = []
     for c in contours:
         area = cv2.contourArea(c)
-        if area < MIN_GREEN_PX or area > MAX_GREEN_PX:
+        if area < t["min_area_px"] or area > t["max_area_px"]:
             continue
-
-        # Circularity: 4π·area/perimeter²  (1.0 = perfect circle)
-        perimeter = cv2.arcLength(c, True)
-        if perimeter < 1:
+        perim = cv2.arcLength(c, True)
+        if perim < 1:
             continue
-        circularity = 4 * np.pi * area / (perimeter ** 2)
-        if circularity < 0.4:   # reject very irregular shapes
+        circularity = 4 * np.pi * area / (perim ** 2)
+        if circularity < t["circularity_min"]:
             continue
+        candidates.append(c)
 
-        # Low texture: stddev of V channel within contour ROI
-        x, y, w, h = cv2.boundingRect(c)
-        roi_v = hsv[y:y+h, x:x+w, 2]
-        texture = float(np.std(roi_v))
-        if texture > 40:   # high texture = rough, not a putting green
-            continue
+    return candidates, mask
 
-        green_candidates.append(c)
 
-    return green_candidates
+def _detect_bunkers(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
+    """
+    Detect bunkers: light sand-coloured bright irregular patches.
+    """
+    cv2 = _get_cv2()
+    t = THRESHOLDS["bunker"]
+
+    mask = _hsv_mask(img_rgb, t["h"], t["s"], t["v"])
+    mask = _morph_clean(mask, open_k=3, close_k=5)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    valid = [
+        c for c in contours
+        if t["min_area_px"] <= cv2.contourArea(c) <= t["max_area_px"]
+    ]
+    return valid, mask
+
+
+def _detect_water(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
+    """
+    Detect water hazards: dark blue/grey regions.
+    Combines blue-hue mask with a dark-value mask for shadowed water.
+    """
+    cv2 = _get_cv2()
+    t = THRESHOLDS["water"]
+
+    # Primary: blue-hue water
+    mask_blue = _hsv_mask(img_rgb, t["h"], t["s"], t["v"])
+
+    # Secondary: very dark regions (V < dark_v_max) that aren't tree-green
+    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+    dark_v = (hsv[:, :, 2] < t["dark_v_max"]).astype(np.uint8) * 255
+    # Exclude dark-green (trees) from the dark mask
+    is_green_hue = ((hsv[:, :, 0] >= 30) & (hsv[:, :, 0] <= 90)).astype(np.uint8)
+    dark_v[is_green_hue == 1] = 0
+
+    mask = cv2.bitwise_or(mask_blue, dark_v)
+    mask = _morph_clean(mask, open_k=5, close_k=7)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    valid = [c for c in contours if cv2.contourArea(c) >= t["min_area_px"]]
+    return valid, mask
+
+
+def _detect_trees(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
+    """
+    Detect tree clusters: dark green, high texture.
+    Trees appear as dark, rough-textured green masses in aerial imagery.
+    """
+    cv2 = _get_cv2()
+    t = THRESHOLDS["trees"]
+
+    mask = _hsv_mask(img_rgb, t["h"], t["s"], t["v"])
+    texture = _local_texture(img_rgb)
+    # Trees MUST be textured — exclude smooth areas (fairways, greens)
+    mask[texture < t["texture_min"]] = 0
+    mask = _morph_clean(mask, open_k=5, close_k=9)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    valid = [c for c in contours if cv2.contourArea(c) >= t["min_area_px"]]
+    return valid, mask
+
+
+def _detect_rough(img_rgb: np.ndarray) -> Tuple[list, np.ndarray]:
+    """
+    Detect rough zones: medium-texture green/yellow-green areas.
+    Rough is less uniform than fairways but less dark/textured than trees.
+    """
+    cv2 = _get_cv2()
+    t = THRESHOLDS["rough"]
+    tex_lo, tex_hi = t["texture_range"]
+
+    mask = _hsv_mask(img_rgb, t["h"], t["s"], t["v"])
+    texture = _local_texture(img_rgb)
+    # Rough has medium texture
+    tex_mask = ((texture >= tex_lo) & (texture <= tex_hi)).astype(np.uint8) * 255
+    mask = cv2.bitwise_and(mask, tex_mask)
+    mask = _morph_clean(mask, open_k=7, close_k=11)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    valid = [c for c in contours if cv2.contourArea(c) >= t["min_area_px"]]
+    return valid, mask
 
 
 # ─── GeoJSON conversion ───────────────────────────────────────────────────────
 
 def _save_detections_geojson(
     contours: list,
-    transform_params: tuple,
+    transform_params: Optional[tuple],
     feature_type: str,
     out_path: Path,
 ) -> None:
-    """
-    Convert pixel contours to WGS84 GeoJSON and save.
-    transform_params: (west, north, lon_per_px, lat_per_px)
-    """
+    """Convert pixel contours → WGS84 GeoJSON polygons and save."""
     from shapely.geometry import Polygon, mapping
-    import cv2
+    cv2 = _get_cv2()
 
     if transform_params is None:
+        _write_geojson_features([], out_path)
         return
 
     west, north, lon_per_px, lat_per_px = transform_params
     features = []
 
     for contour in contours:
-        if len(contour) < 3:
-            continue
         pts = contour.squeeze()
-        if pts.ndim != 2 or pts.shape[1] != 2:
+        if pts.ndim != 2 or pts.shape[0] < 3:
             continue
 
-        # Pixel → WGS84
         coords = [
             (west + float(px) * lon_per_px,
              north - float(py) * lat_per_px)
@@ -456,29 +617,75 @@ def _save_detections_geojson(
             poly = Polygon(coords)
             if not poly.is_valid:
                 poly = poly.buffer(0)
-            if poly.area < 1e-10:
+            if poly.is_empty or poly.area < 1e-12:
                 continue
             features.append({
                 "type": "Feature",
                 "geometry": mapping(poly),
                 "properties": {
-                    "type":   feature_type,
-                    "source": "vision",
-                    "area_px": float(cv2.contourArea(contour)),
+                    "type":     feature_type,
+                    "source":   "vision",
+                    "area_px":  float(cv2.contourArea(contour)),
+                    "confidence": 0.6,  # vision detections are medium confidence
                 },
             })
         except Exception:
             continue
 
-    geojson = {"type": "FeatureCollection", "features": features}
-    out_path.write_text(json.dumps(geojson, indent=2))
+    _write_geojson_features(features, out_path)
+
+
+# ─── Debug output ─────────────────────────────────────────────────────────────
+
+OVERLAY_COLOURS_BGR = {
+    "fairway": (100, 220, 100),   # green
+    "green":   (0,   180,   0),   # dark green
+    "bunker":  (100, 210, 255),   # sand/yellow
+    "water":   (220,  50,  50),   # blue
+    "trees":   (0,    80,   0),   # very dark green
+    "rough":   (60,  130,  60),   # olive
+}
 
 
 def _save_debug_image(img_rgb: np.ndarray, out_path: Path) -> None:
-    """Save the satellite mosaic as a JPEG for visual debugging."""
     from PIL import Image
-    img = Image.fromarray(img_rgb)
-    img.save(str(out_path), quality=80)
+    Image.fromarray(img_rgb).save(str(out_path), quality=82)
+
+
+def _save_detection_overlay(
+    img_rgb: np.ndarray,
+    all_masks: Dict[str, np.ndarray],
+    out_path: Path,
+) -> None:
+    """Save satellite mosaic with semi-transparent detection overlays."""
+    cv2 = _get_cv2()
+
+    overlay = img_rgb.copy()
+    colour_map = {
+        "fairway": (100, 220, 100),
+        "green":   (0,   200,   0),
+        "bunker":  (255, 220, 100),
+        "water":   (50,   50, 220),
+        "trees":   (0,    60,   0),
+        "rough":   (80,  140,  80),
+    }
+
+    for feat_type, mask in all_masks.items():
+        colour = colour_map.get(feat_type, (128, 128, 128))
+        coloured = np.zeros_like(img_rgb)
+        coloured[mask > 0] = colour
+        overlay = cv2.addWeighted(overlay, 0.75, coloured, 0.25, 0)
+
+    from PIL import Image
+    Image.fromarray(overlay).save(str(out_path), quality=82)
+
+
+# ─── Utilities ────────────────────────────────────────────────────────────────
+
+def _write_geojson_features(features: list, out_path: Path) -> None:
+    out_path.write_text(json.dumps(
+        {"type": "FeatureCollection", "features": features}, indent=2
+    ))
 
 
 def _load_geojson(path: Path) -> list:

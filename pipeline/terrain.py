@@ -57,22 +57,44 @@ def process_terrain(dtm_path: Path, boundary_data: dict, output_dir: Path) -> di
 
     Returns:
         terrain_stats dict with keys used downstream
+
+    V2 hardening order:
+        1. Validate raw DEM integrity BEFORE any reprojection or clipping
+        2. Reproject to ITM
+        3. Validate reprojected DEM
+        4. Clip with progressive buffer fallback
+        5. Validate clipped DEM (lenient — sparse is OK after clipping)
+        6. Fill NaN → Gaussian smooth → slope → classify
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 1: Reproject DTM to Irish Transverse Mercator at target resolution
+    from pipeline.lidar import validate_dem_integrity, validate_dem_post_clip
+
+    # ── STAGE A: Validate raw DEM BEFORE any processing ───────────────────────
+    log.info("Validating raw DEM integrity...")
+    validate_dem_integrity(dtm_path)   # raises RuntimeError if empty/all-NaN/<4x4
+
+    # ── STAGE B: Reproject DTM to ITM ─────────────────────────────────────────
     dtm_itm_path = output_dir / "dtm_itm.tif"
     log.info("Reprojecting DTM to ITM...")
     _reproject_to_itm(dtm_path, dtm_itm_path)
 
-    # Step 2: Clip to course boundary (with buffer)
-    dtm_clipped_path = output_dir / "dtm_clipped.tif"
-    log.info("Clipping DTM to course boundary...")
-    boundary_poly = shape(boundary_data["boundary_wgs84"])
-    _clip_to_boundary(dtm_itm_path, dtm_clipped_path, boundary_poly, boundary_data)
+    # ── STAGE C: Validate reprojected DEM (before clipping) ───────────────────
+    log.info("Validating reprojected DEM...")
+    validate_dem_integrity(dtm_itm_path)
 
-    # Step 3: Read processed DTM
+    # ── STAGE D: Clip with progressive buffer reduction ────────────────────────
+    dtm_clipped_path = output_dir / "dtm_clipped.tif"
+    boundary_poly = shape(boundary_data["boundary_wgs84"])
+    log.info("Clipping DTM to course boundary (with progressive buffer fallback)...")
+    _clip_to_boundary_with_retry(dtm_itm_path, dtm_clipped_path, boundary_poly, boundary_data)
+
+    # ── STAGE E: Validate clipped DEM (lenient — allows sparse data) ──────────
+    log.info("Validating clipped DEM coverage...")
+    validate_dem_post_clip(dtm_clipped_path)
+
+    # ── STAGE F: Read and process ─────────────────────────────────────────────
     with rasterio.open(dtm_clipped_path) as src:
         dtm_arr = src.read(1).astype(np.float32)
         nodata  = src.nodata
@@ -84,14 +106,8 @@ def process_terrain(dtm_path: Path, boundary_data: dict, output_dir: Path) -> di
     if nodata is not None:
         dtm_arr[dtm_arr == nodata] = np.nan
 
-    # V2: Validate DEM integrity before any processing
-    from pipeline.lidar import validate_dem_integrity
-    validate_dem_integrity(dtm_clipped_path)
-
-    # V2: Fill NaN cells with spatial median (more robust than mean for sparse nodata)
+    # Fill NaN → smooth → slope
     dtm_arr = _median_fill_nan(dtm_arr)
-
-    # V2: Gaussian smoothing to reduce LiDAR/DEM noise
     dtm_arr = _gaussian_smooth(dtm_arr)
 
     # Step 4: Compute statistics
@@ -210,32 +226,82 @@ def _reproject_to_itm(src_path: Path, dst_path: Path) -> None:
                 )
 
 
-def _clip_to_boundary(
+def _clip_to_boundary_with_retry(
     dtm_path: Path, dst_path: Path,
     boundary_poly, boundary_data: dict
 ) -> None:
-    """Clip DTM to the course boundary polygon projected to ITM."""
+    """
+    Clip DTM to course boundary with progressive buffer reduction.
+
+    Problem 3: boundary buffers can exceed DEM coverage (especially for
+    courses near Mapzen tile edges or coastal locations).
+
+    Strategy: try buffers [300m, 150m, 50m, 0m] in order.
+    Accept the first clip that has ≥5% valid coverage.
+    """
     from pyproj import Transformer
     from shapely.ops import transform as shp_transform
 
     t = Transformer.from_crs(config.CRS_WGS84, config.CRS_ITM, always_xy=True)
     boundary_itm = shp_transform(t.transform, boundary_poly)
 
-    # Use buffered bounding box as clip region (preserve context around course)
-    buf = config.BOUNDARY_BUFFER_M
-    clipped_region = boundary_itm.buffer(buf)
+    # Buffer schedule: generous first, then progressively tighter
+    buffer_schedule = [config.BOUNDARY_BUFFER_M, 150, 50, 0]
+    # Remove duplicates while preserving order
+    seen = set()
+    buffers = []
+    for b in buffer_schedule:
+        if b not in seen:
+            seen.add(b)
+            buffers.append(b)
 
-    with rasterio.open(dtm_path) as src:
-        out_image, out_transform = rio_mask(src, [mapping(clipped_region)], crop=True)
-        out_meta = src.meta.copy()
-        out_meta.update({
-            "driver":    "GTiff",
-            "height":    out_image.shape[1],
-            "width":     out_image.shape[2],
-            "transform": out_transform,
-        })
-        with rasterio.open(dst_path, "w", **out_meta) as dst:
-            dst.write(out_image)
+    last_error = None
+    for buf in buffers:
+        try:
+            clip_region = boundary_itm.buffer(buf) if buf > 0 else boundary_itm
+            with rasterio.open(dtm_path) as src:
+                out_image, out_transform = rio_mask(
+                    src, [mapping(clip_region)], crop=True
+                )
+                out_meta = src.meta.copy()
+                out_meta.update({
+                    "driver":    "GTiff",
+                    "height":    out_image.shape[1],
+                    "width":     out_image.shape[2],
+                    "transform": out_transform,
+                })
+
+            # Quick validity check on clip result
+            clip_arr = out_image[0].astype(np.float32)
+            nodata_val = out_meta.get("nodata")
+            if nodata_val is not None:
+                valid_mask = clip_arr != nodata_val
+            else:
+                valid_mask = np.isfinite(clip_arr)
+
+            valid_pct = float(valid_mask.sum()) / max(clip_arr.size, 1) * 100
+            if valid_pct < 5.0:
+                log.warning(
+                    f"Clip with buffer={buf}m has only {valid_pct:.1f}% valid "
+                    f"pixels — trying smaller buffer"
+                )
+                continue
+
+            with rasterio.open(dst_path, "w", **out_meta) as dst:
+                dst.write(out_image)
+
+            log.info(f"Clip succeeded with buffer={buf}m ({valid_pct:.1f}% valid)")
+            return
+
+        except Exception as e:
+            last_error = e
+            log.warning(f"Clip failed with buffer={buf}m: {e}")
+            continue
+
+    raise RuntimeError(
+        f"DEM clipping failed for all buffer values {buffers}. "
+        f"The DEM may not cover the course boundary. Last error: {last_error}"
+    )
 
 
 # ─── Heightmap ────────────────────────────────────────────────────────────────
