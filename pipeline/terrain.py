@@ -81,8 +81,10 @@ def process_terrain(dtm_path: Path, boundary_data: dict, output_dir: Path) -> di
     _reproject_to_itm(dtm_path, dtm_itm_path)
 
     # ── STAGE C: Validate reprojected DEM (before clipping) ───────────────────
+    # Use lenient check: reprojection introduces edge nodata (like clipping does).
+    # Strict ≥10% threshold is reserved for raw downloaded tiles only.
     log.info("Validating reprojected DEM...")
-    validate_dem_integrity(dtm_itm_path)
+    validate_dem_post_clip(dtm_itm_path)
 
     # ── STAGE D: Clip with progressive buffer reduction ────────────────────────
     dtm_clipped_path = output_dir / "dtm_clipped.tif"
@@ -189,26 +191,35 @@ def process_terrain(dtm_path: Path, boundary_data: dict, output_dir: Path) -> di
 def _reproject_to_itm(src_path: Path, dst_path: Path) -> None:
     """Reproject raster to ITM (EPSG:2157) at config.DTM_RESOLUTION_M."""
     dst_crs = CRS.from_epsg(2157)
+    res = config.DTM_RESOLUTION_M
 
     with rasterio.open(src_path) as src:
-        transform, width, height = calculate_default_transform(
+        # calculate_default_transform returns the optimal transform and dimensions
+        # in the destination CRS.  transform.a is pixel width in dst units (metres
+        # for ITM), so we scale the default pixel count to reach the target resolution.
+        default_transform, default_width, default_height = calculate_default_transform(
             src.crs, dst_crs, src.width, src.height, *src.bounds
         )
-        # Snap to target resolution
-        res = config.DTM_RESOLUTION_M
-        transform = rasterio.transform.from_origin(
-            transform.c, transform.f,
+        default_res = abs(default_transform.a)  # metres per pixel in dst CRS
+
+        # Scale pixel counts so the output covers the same extent at target_res
+        scale = default_res / res
+        new_width  = max(4, int(round(default_width  * scale)))
+        new_height = max(4, int(round(default_height * scale)))
+
+        new_transform = rasterio.transform.from_origin(
+            default_transform.c, default_transform.f,
             res, res,
         )
-        width  = max(1, int(abs(src.bounds.right  - src.bounds.left)  / res) + 1)
-        height = max(1, int(abs(src.bounds.top    - src.bounds.bottom) / res) + 1)
+
+        src_nodata = src.nodata  # preserve source nodata (e.g. -32768 from Terrarium)
 
         kwargs = src.meta.copy()
         kwargs.update({
             "crs":       dst_crs,
-            "transform": transform,
-            "width":     width,
-            "height":    height,
+            "transform": new_transform,
+            "width":     new_width,
+            "height":    new_height,
             "dtype":     "float32",
             "nodata":    -9999.0,
         })
@@ -220,8 +231,10 @@ def _reproject_to_itm(src_path: Path, dst_path: Path) -> None:
                     destination=rasterio.band(dst, i),
                     src_transform=src.transform,
                     src_crs=src.crs,
-                    dst_transform=transform,
+                    src_nodata=src_nodata,
+                    dst_transform=new_transform,
                     dst_crs=dst_crs,
+                    dst_nodata=-9999.0,
                     resampling=Resampling.bilinear,
                 )
 
