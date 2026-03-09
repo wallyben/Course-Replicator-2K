@@ -616,7 +616,7 @@ document.querySelectorAll('.step-check').forEach(cb => {{
 </body>
 </html>"""
 
-    out_path.write_text(html)
+    out_path.write_text(html, encoding="utf-8")
     log.info(f"Build guide written: {out_path}")
 
 

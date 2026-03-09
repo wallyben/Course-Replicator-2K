@@ -326,6 +326,9 @@ def _attach_fairway_corridors(
     for hole in holes:
         tee_pos   = hole["tee_position"]
         green_pos = hole["green_position"]
+        if tee_pos is None or green_pos is None:
+            hole["fairway_corridor"] = None
+            continue
         line = LineString([
             (tee_pos["lon"], tee_pos["lat"]),
             (green_pos["lon"], green_pos["lat"]),
