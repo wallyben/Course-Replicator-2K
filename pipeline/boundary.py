@@ -1,22 +1,40 @@
 """
-boundary.py — Course boundary resolution via OpenStreetMap Overpass API.
+boundary.py — Course boundary resolution via multi-source geocoding cascade.
 
 Resolves a golf course name to:
-- Boundary polygon (GeoJSON)
+- Boundary polygon (GeoJSON) — the actual OSM course outline, not a bbox
 - Bounding box with buffer
 - Centre point
 - Basic metadata (name, OSM ID, area m²)
+
+Resolution cascade (in order):
+  1. Nominatim geocode → precise lat/lon for the named course
+  2. Overpass polygon query around geocoded point (radius 500m, then 1500m)
+     → finds the actual golf_course polygon regardless of name matching
+  3. KNOWN_COURSES bbox centre as geocode seed (when Nominatim fails)
+  4. Overpass name-based search (legacy fallback)
+  5. KNOWN_COURSES bbox directly (last resort for offline use)
+  6. Raise ValueError with helpful --bbox hint
+
+Why Nominatim first?
+  Nominatim is a purpose-built geocoder that resolves business names to
+  precise coordinates.  An Overpass name-match query for "Old Conna Golf Club"
+  will time out on a busy server or return zero results if the OSM name tag
+  is spelled differently.  A Nominatim result gives us (lat, lon) which we
+  can use to find the actual polygon without relying on name-string matching.
+
+Verification:
+  verify_boundary_fit(boundary_data, feature_counts) — called by run_pipeline
+  after vision detection to detect wrong-course reconstructions early.
 """
 
 import json
 import logging
 import math
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import requests
-import geopandas as gpd
-import pandas as pd
 from shapely.geometry import shape, box, mapping
 from shapely.ops import unary_union
 import pyproj
@@ -29,213 +47,425 @@ import config
 
 log = logging.getLogger(__name__)
 
-# FIX 3: Bbox area constraints (hectares → m²)
-_BBOX_AREA_MIN_M2 = 40  * 10_000   # 40 ha
-_BBOX_AREA_MAX_M2 = 200 * 10_000   # 200 ha
+# ─── Area constraints ─────────────────────────────────────────────────────────
+_BBOX_AREA_MIN_M2   = 40  * 10_000   # 40 ha  — smallest real 18-hole course
+_BBOX_AREA_MAX_M2   = 150 * 10_000   # 150 ha — largest realistic single course
+
+# Overpass search radii for coordinate-based polygon lookup
+_RADIUS_TIGHT_M  = 500    # first attempt — should contain the course centre
+_RADIUS_WIDE_M   = 1500   # second attempt — if course is large or geocode is offset
+
+# Nominatim endpoint — public instance with required User-Agent header
+_NOMINATIM_URL   = getattr(config, "NOMINATIM_URL", "https://nominatim.openstreetmap.org/search")
+_NOMINATIM_TIMEOUT = getattr(config, "NOMINATIM_TIMEOUT", 12)
+
+# Verification thresholds
+_VERIFY_GREEN_MIN = 8    # fewer than this strongly suggests wrong course
+_VERIFY_GREEN_MAX = 35   # more than this is probably multiple courses
 
 
-# ─── Overpass query templates ─────────────────────────────────────────────────
-
-def _overpass_query_by_name(name: str) -> str:
-    """Build an Overpass query to find a golf course by name."""
-    escaped = name.replace('"', '\\"')
-    return f"""
-[out:json][timeout:{config.OVERPASS_TIMEOUT}];
-(
-  way["leisure"="golf_course"]["name"~"{escaped}",i];
-  relation["leisure"="golf_course"]["name"~"{escaped}",i];
-  way["landuse"="golf_course"]["name"~"{escaped}",i];
-  relation["landuse"="golf_course"]["name"~"{escaped}",i];
-);
-out body;
->;
-out skel qt;
-"""
-
-
-def _overpass_query_relation_full(relation_id: int) -> str:
-    """Fetch all nodes of a relation."""
-    return f"""
-[out:json][timeout:{config.OVERPASS_TIMEOUT}];
-relation({relation_id});
-out body;
->;
-out skel qt;
-"""
-
-
-def _overpass_query_way_full(way_id: int) -> str:
-    """Fetch all nodes of a way."""
-    return f"""
-[out:json][timeout:{config.OVERPASS_TIMEOUT}];
-way({way_id});
-out body;
->;
-out skel qt;
-"""
-
-
-# ─── Geometry reconstruction from Overpass JSON ──────────────────────────────
-
-def _reconstruct_nodes(elements: list) -> dict:
-    """Build node-id → (lon, lat) lookup from Overpass elements."""
-    return {
-        el["id"]: (el["lon"], el["lat"])
-        for el in elements
-        if el["type"] == "node"
-    }
-
-
-def _reconstruct_way_coords(way_nodes: list, node_map: dict) -> list:
-    """Convert a way's node-ref list to coordinate pairs."""
-    coords = []
-    for nid in way_nodes:
-        if nid in node_map:
-            coords.append(node_map[nid])
-    return coords
-
-
-def _ways_to_polygon(elements: list) -> Optional[object]:
-    """Attempt to reconstruct boundary polygon from Overpass way elements."""
-    from shapely.geometry import Polygon, MultiPolygon, LinearRing
-    from shapely.ops import polygonize
-
-    node_map = _reconstruct_nodes(elements)
-    rings = []
-
-    for el in elements:
-        if el["type"] != "way":
-            continue
-        coords = _reconstruct_way_coords(el.get("nodes", []), node_map)
-        if len(coords) >= 4:
-            rings.append(coords)
-
-    if not rings:
-        return None
-
-    # Try direct polygon (single closed way)
-    if len(rings) == 1:
-        try:
-            poly = Polygon(rings[0])
-            if poly.is_valid:
-                return poly
-            return poly.buffer(0)
-        except Exception:
-            return None
-
-    # Multiple ways — try polygonize
-    from shapely.geometry import LineString
-    lines = [LineString(r) for r in rings]
-    polys = list(polygonize(lines))
-    if polys:
-        merged = unary_union(polys)
-        return merged
-
-    return None
-
-
-# ─── Main resolution function ─────────────────────────────────────────────────
+# ─── Public API ───────────────────────────────────────────────────────────────
 
 def resolve_boundary(course_name: str) -> dict:
     """
     Resolve a golf course name to boundary data.
 
-    Resolution strategy (in order):
-      1. Check KNOWN_COURSES lookup in config (instant, no network)
-      2. Try full name against OSM Overpass
-      3. Try progressively shortened name variants (drop "Golf Club", "Golf", etc.)
-      4. Try Ireland-wide area search with significant word only
-      5. Raise with helpful error including --bbox suggestion
+    Cascade:
+      1. Nominatim geocode → (lat, lon)
+      2. Overpass polygon around geocoded point (500m, then 1500m)
+      3. KNOWN_COURSES bbox centre → same Overpass polygon query
+      4. Overpass name-search (legacy)
+      5. KNOWN_COURSES bbox directly
+      6. Raise ValueError
 
-    Returns:
-        {
-            "name": str,
-            "osm_id": int or None,
-            "osm_type": str,
-            "boundary_wgs84": dict,
-            "bbox_wgs84": list,
-            "bbox_buffered_itm": list,
-            "centre_wgs84": list,
-            "area_m2": float,
-            "matched_name": str,
-            "confidence": str,
-        }
+    Returns boundary dict with keys:
+      name, matched_name, osm_id, osm_type, boundary_wgs84,
+      bbox_wgs84, bbox_buffered_itm, centre_wgs84, area_m2, confidence
     """
     log.info(f"Resolving boundary for: {course_name!r}")
 
-    # ── Strategy 1: KNOWN_COURSES lookup ────────────────────────────────────
-    key = course_name.strip().lower()
-    if key in config.KNOWN_COURSES:
-        bbox = config.KNOWN_COURSES[key]
-        log.info(f"Found in KNOWN_COURSES — using hardcoded bbox: {bbox}")
-        return boundary_from_bbox(*bbox, course_name=course_name)
+    # ── Step 1: Nominatim geocode ────────────────────────────────────────────
+    geocode_result = _nominatim_geocode(course_name)
+    if geocode_result:
+        lat, lon, nom_osm_id, nom_osm_type, nom_display = geocode_result
+        log.info(
+            f"Nominatim geocoded: {nom_display!r} → "
+            f"({lat:.5f}, {lon:.5f})"
+        )
+        # ── Step 2a: Overpass around geocoded point ──────────────────────────
+        poly_result = _overpass_polygon_around_point(lat, lon, _RADIUS_TIGHT_M)
+        if poly_result is None:
+            log.info(
+                f"No polygon within {_RADIUS_TIGHT_M}m — widening to {_RADIUS_WIDE_M}m"
+            )
+            poly_result = _overpass_polygon_around_point(lat, lon, _RADIUS_WIDE_M)
 
-    # ── Strategy 2–4: OSM Overpass with name variants ────────────────────────
+        if poly_result:
+            polygon, matched_name, osm_id, osm_type = poly_result
+            return _build_boundary_dict(
+                polygon, course_name, matched_name, osm_id, osm_type,
+                confidence="HIGH",
+            )
+
+    # ── Step 3: KNOWN_COURSES bbox centre as geocode seed ────────────────────
+    key = course_name.strip().lower()
+    known_bbox = config.KNOWN_COURSES.get(key)
+    if known_bbox:
+        ctr_lon = (known_bbox[0] + known_bbox[2]) / 2.0
+        ctr_lat = (known_bbox[1] + known_bbox[3]) / 2.0
+        log.info(
+            f"KNOWN_COURSES seed for {key!r}: "
+            f"centre ({ctr_lat:.5f}, {ctr_lon:.5f}) — querying Overpass polygon"
+        )
+        for radius in (_RADIUS_TIGHT_M, _RADIUS_WIDE_M):
+            poly_result = _overpass_polygon_around_point(ctr_lat, ctr_lon, radius)
+            if poly_result:
+                polygon, matched_name, osm_id, osm_type = poly_result
+                log.info(
+                    f"KNOWN_COURSES seed resolved polygon: {matched_name!r} "
+                    f"at radius {radius}m"
+                )
+                return _build_boundary_dict(
+                    polygon, course_name, matched_name, osm_id, osm_type,
+                    confidence="HIGH",
+                )
+        # Polygon not found — fall back to bbox but log clearly
+        log.warning(
+            f"KNOWN_COURSES Overpass polygon lookup failed — using raw bbox "
+            f"(course may be mis-tagged in OSM)"
+        )
+        return boundary_from_bbox(*known_bbox, course_name=course_name)
+
+    # ── Step 4: Overpass name-search (legacy fallback) ───────────────────────
+    log.info("Nominatim unavailable and no KNOWN_COURSES entry — trying name search")
     name_variants = _build_name_variants(course_name)
     elements      = []
 
     for variant in name_variants:
-        log.info(f"Trying OSM query: {variant!r}")
+        log.info(f"Trying OSM name query: {variant!r}")
         query = _overpass_query_by_name(variant)
-        resp  = _overpass_request(query)
-        elements = resp.get("elements", [])
+        try:
+            resp = _overpass_request(query)
+        except RuntimeError as e:
+            log.warning(f"Overpass name search failed: {e}")
+            break
+        elements   = resp.get("elements", [])
         candidates = [e for e in elements if e["type"] in ("relation", "way")]
         if candidates:
-            log.info(f"Found {len(candidates)} candidate(s) with variant {variant!r}")
+            log.info(f"Found {len(candidates)} candidate(s) for {variant!r}")
             break
         log.info(f"No results for variant {variant!r}")
 
-    if not elements or not [e for e in elements if e["type"] in ("relation", "way")]:
-        # Build a useful error with the known-courses hint
-        _raise_not_found(course_name)
-
-    # Find the best candidate
-    candidates = [e for e in elements if e["type"] in ("relation", "way")]
-    scored = []
-    for el in candidates:
-        tags    = el.get("tags", {})
-        el_name = tags.get("name", "")
-        score   = _name_similarity(course_name.lower(), el_name.lower())
-        scored.append((score, el))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    best_score, best_el = scored[0]
-
-    confidence   = "HIGH" if best_score > 0.7 else ("MEDIUM" if best_score > 0.4 else "LOW")
-    matched_name = best_el.get("tags", {}).get("name", "Unknown")
-
-    log.info(f"Best match: {matched_name!r} (score={best_score:.2f}, confidence={confidence})")
-
-    # Reconstruct geometry
-    polygon = _ways_to_polygon(elements)
-    if polygon is None:
-        osm_type = best_el["type"]
-        osm_id   = best_el["id"]
-        if osm_type == "relation":
-            full_resp = _overpass_request(_overpass_query_relation_full(osm_id))
-        else:
-            full_resp = _overpass_request(_overpass_query_way_full(osm_id))
-        polygon = _ways_to_polygon(full_resp.get("elements", []))
-
-    if polygon is None:
-        raise ValueError(
-            f"Could not reconstruct boundary polygon for {matched_name!r}. "
-            "The OSM boundary may be incomplete. Use --bbox to specify manually."
+    if elements and [e for e in elements if e["type"] in ("relation", "way")]:
+        candidates = [e for e in elements if e["type"] in ("relation", "way")]
+        scored = sorted(
+            [(  _name_similarity(course_name.lower(),
+                                 el.get("tags", {}).get("name", "").lower()),
+                el)
+             for el in candidates],
+            key=lambda x: x[0], reverse=True,
         )
+        best_score, best_el = scored[0]
+        confidence   = "HIGH" if best_score > 0.7 else ("MEDIUM" if best_score > 0.4 else "LOW")
+        matched_name = best_el.get("tags", {}).get("name", "Unknown")
+        log.info(f"Name-search best match: {matched_name!r} (score={best_score:.2f})")
+
+        polygon = _ways_to_polygon(elements)
+        if polygon is None:
+            osm_type = best_el["type"]
+            osm_id   = best_el["id"]
+            full_resp = _overpass_request(
+                _overpass_query_relation_full(osm_id) if osm_type == "relation"
+                else _overpass_query_way_full(osm_id)
+            )
+            polygon = _ways_to_polygon(full_resp.get("elements", []))
+
+        if polygon is not None:
+            return _build_boundary_dict(
+                polygon, course_name, matched_name, best_el["id"],
+                best_el["type"], confidence=confidence,
+            )
+
+    # ── Step 5: KNOWN_COURSES raw bbox (last resort) ──────────────────────────
+    if known_bbox:
+        log.warning(
+            f"All Overpass attempts failed — using KNOWN_COURSES raw bbox "
+            f"(accuracy LOW)"
+        )
+        return boundary_from_bbox(*known_bbox, course_name=course_name)
+
+    # ── Step 6: Give up ───────────────────────────────────────────────────────
+    _raise_not_found(course_name)
+
+
+def verify_boundary_fit(
+    boundary_data: dict,
+    feature_counts: dict,
+) -> Tuple[bool, str]:
+    """
+    Verify the boundary is plausible given the detected feature counts.
+
+    Called by run_pipeline after vision detection.  If the boundary appears
+    wrong (wrong course reconstructed), the caller should re-query with a
+    larger radius or warn the user.
+
+    Args:
+        boundary_data:  boundary dict from resolve_boundary()
+        feature_counts: {"green": N, "fairway": N, "bunker": N, ...}
+
+    Returns:
+        (is_ok: bool, reason: str)
+    """
+    green_count = feature_counts.get("green", 0)
+    area_ha     = boundary_data.get("area_m2", 0) / 10_000
+
+    if green_count < _VERIFY_GREEN_MIN:
+        return (
+            False,
+            f"Only {green_count} greens detected (expected ≥{_VERIFY_GREEN_MIN}). "
+            f"Boundary may cover the wrong course or be too small. "
+            f"Area: {area_ha:.1f} ha. Try --bbox for a manual boundary.",
+        )
+
+    if green_count > _VERIFY_GREEN_MAX:
+        return (
+            False,
+            f"{green_count} greens detected (expected ≤{_VERIFY_GREEN_MAX}). "
+            f"Boundary may cover multiple adjacent courses. "
+            f"Area: {area_ha:.1f} ha.",
+        )
+
+    if area_ha < 30:
+        return (
+            False,
+            f"Course area {area_ha:.1f} ha is very small for an 18-hole course "
+            f"(expected ≥40 ha). Boundary may be incomplete.",
+        )
+
+    return (True, f"Boundary OK — {green_count} greens, {area_ha:.1f} ha")
+
+
+# ─── Nominatim geocoding ──────────────────────────────────────────────────────
+
+def _nominatim_geocode(
+    course_name: str,
+) -> Optional[Tuple[float, float, Optional[int], Optional[str], str]]:
+    """
+    Geocode a course name using the Nominatim API.
+
+    Queries Nominatim for the course name, filtering to
+    amenity/leisure types (golf_course, leisure centre, etc.).
+
+    Returns (lat, lon, osm_id, osm_type, display_name) or None on failure.
+    """
+    params = {
+        "q":              course_name,
+        "format":         "json",
+        "limit":          5,
+        "addressdetails": 0,
+        "extratags":      1,
+    }
+    headers = {
+        "User-Agent": "CourseReplicator2K/3.0 (golf-course-pipeline; research)",
+        "Accept-Language": "en",
+    }
+
+    try:
+        resp = requests.get(
+            _NOMINATIM_URL,
+            params=params,
+            headers=headers,
+            timeout=_NOMINATIM_TIMEOUT,
+        )
+        resp.raise_for_status()
+        results = resp.json()
+    except Exception as e:
+        log.warning(f"Nominatim geocode failed: {e}")
+        return None
+
+    if not results:
+        log.info(f"Nominatim: no results for {course_name!r}")
+        return None
+
+    # Prefer results tagged as golf_course/leisure; fall back to first result
+    def _is_golf(r: dict) -> bool:
+        tags = r.get("extratags", {}) or {}
+        return (
+            r.get("class") in ("leisure", "amenity", "sport")
+            or tags.get("leisure") == "golf_course"
+            or "golf" in r.get("display_name", "").lower()
+            or "golf" in r.get("type", "").lower()
+        )
+
+    golf_results = [r for r in results if _is_golf(r)]
+    best = golf_results[0] if golf_results else results[0]
+
+    try:
+        lat      = float(best["lat"])
+        lon      = float(best["lon"])
+        osm_id   = int(best["osm_id"])   if best.get("osm_id")   else None
+        osm_type = best.get("osm_type")
+        display  = best.get("display_name", course_name)
+        return (lat, lon, osm_id, osm_type, display)
+    except (KeyError, ValueError, TypeError) as e:
+        log.warning(f"Nominatim result parse error: {e}")
+        return None
+
+
+# ─── Coordinate-based Overpass polygon query ─────────────────────────────────
+
+def _overpass_polygon_around_point(
+    lat: float,
+    lon: float,
+    radius_m: float,
+) -> Optional[Tuple[object, str, int, str]]:
+    """
+    Query Overpass for a golf_course polygon within radius_m metres of (lat, lon).
+
+    Selects the polygon whose centroid is closest to (lat, lon) and whose area
+    is within the valid range [40 ha, 150 ha].
+
+    Returns (polygon, matched_name, osm_id, osm_type) or None.
+    """
+    query = f"""
+[out:json][timeout:{config.OVERPASS_TIMEOUT}];
+(
+  way["leisure"="golf_course"](around:{radius_m:.0f},{lat},{lon});
+  relation["leisure"="golf_course"](around:{radius_m:.0f},{lat},{lon});
+  way["landuse"="golf_course"](around:{radius_m:.0f},{lat},{lon});
+  relation["landuse"="golf_course"](around:{radius_m:.0f},{lat},{lon});
+);
+out body;
+>;
+out skel qt;
+"""
+    try:
+        resp     = _overpass_request(query, retries=3)
+        elements = resp.get("elements", [])
+    except RuntimeError as e:
+        log.warning(f"Overpass around-point query failed: {e}")
+        return None
+
+    if not elements:
+        return None
+
+    candidates = [e for e in elements if e["type"] in ("relation", "way")]
+    if not candidates:
+        return None
+
+    log.info(
+        f"Overpass around ({lat:.5f},{lon:.5f}) r={radius_m:.0f}m: "
+        f"{len(candidates)} candidate(s)"
+    )
+
+    t_to_itm = Transformer.from_crs("EPSG:4326", "EPSG:2157", always_xy=True)
+    from shapely.ops import transform
+
+    # Reconstruct polygon for each candidate and score by centroid distance + area
+    node_map = _reconstruct_nodes(elements)
+    best_poly    = None
+    best_dist    = float("inf")
+    best_name    = "Unknown"
+    best_osm_id  = 0
+    best_osm_type = "way"
+
+    for el in candidates:
+        tags = el.get("tags", {})
+        name = tags.get("name", tags.get("alt_name", "Unknown"))
+
+        # Reconstruct polygon for this element
+        if el["type"] == "way":
+            coords = _reconstruct_way_coords(el.get("nodes", []), node_map)
+            poly   = _coords_to_polygon(coords)
+        else:
+            # Relation: collect member way polygons
+            poly = _ways_to_polygon(elements)
+
+        if poly is None:
+            continue
+        if poly.geom_type == "MultiPolygon":
+            poly = max(poly.geoms, key=lambda p: p.area)
+        if poly.is_empty or not poly.is_valid:
+            poly = poly.buffer(0)
+
+        # Area check
+        try:
+            poly_itm = transform(t_to_itm.transform, poly)
+            area_m2  = poly_itm.area
+        except Exception:
+            continue
+
+        if area_m2 < _BBOX_AREA_MIN_M2 * 0.5:
+            # Allow polygons down to 20 ha (some course outlines are clipped)
+            log.debug(f"Candidate {name!r}: too small {area_m2/10000:.1f} ha — skip")
+            continue
+        if area_m2 > _BBOX_AREA_MAX_M2 * 2.0:
+            log.debug(f"Candidate {name!r}: too large {area_m2/10000:.1f} ha — skip")
+            continue
+
+        # Distance from query point to polygon centroid
+        centroid = poly.centroid
+        dist = _haversine(lat, lon, centroid.y, centroid.x)
+
+        if dist < best_dist:
+            best_dist     = dist
+            best_poly     = poly
+            best_name     = name
+            best_osm_id   = el["id"]
+            best_osm_type = el["type"]
+
+    if best_poly is None:
+        return None
+
+    log.info(
+        f"Selected polygon: {best_name!r} "
+        f"(centroid {best_dist:.0f}m from query point)"
+    )
+    return (best_poly, best_name, best_osm_id, best_osm_type)
+
+
+# ─── Boundary dict builder ────────────────────────────────────────────────────
+
+def _build_boundary_dict(
+    polygon,
+    course_name: str,
+    matched_name: str,
+    osm_id: int,
+    osm_type: str,
+    confidence: str = "HIGH",
+) -> dict:
+    """
+    Build the standard boundary dict from a validated Shapely polygon.
+    Validates area and adjusts confidence; clips to 40–150 ha via convex hull
+    if the polygon is oddly large.
+    """
+    from shapely.ops import transform
+
+    t_to_itm = Transformer.from_crs("EPSG:4326", "EPSG:2157", always_xy=True)
 
     if polygon.geom_type == "MultiPolygon":
         polygon = max(polygon.geoms, key=lambda p: p.area)
 
-    centroid   = polygon.centroid
-    bbox_wgs84 = list(polygon.bounds)
+    poly_itm  = transform(t_to_itm.transform, polygon)
+    area_m2   = poly_itm.area
+    area_ha   = area_m2 / 10_000
 
-    transformer_to_itm = Transformer.from_crs(config.CRS_WGS84, config.CRS_ITM, always_xy=True)
-    from shapely.ops import transform
-    polygon_itm = transform(transformer_to_itm.transform, polygon)
+    log.info(f"Boundary polygon area: {area_ha:.1f} ha — {matched_name!r}")
 
-    buf = config.BOUNDARY_BUFFER_M
-    itm_bounds = polygon_itm.bounds
-    bbox_buffered_itm = [
+    # If area outside [30, 200] ha, warn and downgrade confidence
+    if not (_BBOX_AREA_MIN_M2 * 0.75 <= area_m2 <= _BBOX_AREA_MAX_M2 * 1.5):
+        log.warning(
+            f"Boundary area {area_ha:.1f} ha is outside expected range "
+            f"[{_BBOX_AREA_MIN_M2/10000:.0f}–{_BBOX_AREA_MAX_M2/10000:.0f} ha]. "
+            f"Keeping polygon but confidence reduced."
+        )
+        confidence = "MEDIUM" if confidence == "HIGH" else confidence
+
+    centroid      = polygon.centroid
+    bbox_wgs84    = list(polygon.bounds)
+    itm_bounds    = poly_itm.bounds
+    buf           = config.BOUNDARY_BUFFER_M
+    bbox_buffered = [
         itm_bounds[0] - buf,
         itm_bounds[1] - buf,
         itm_bounds[2] + buf,
@@ -243,16 +473,16 @@ def resolve_boundary(course_name: str) -> dict:
     ]
 
     return {
-        "name":                course_name,
-        "matched_name":        matched_name,
-        "osm_id":              best_el["id"],
-        "osm_type":            best_el["type"],
-        "boundary_wgs84":      mapping(polygon),
-        "bbox_wgs84":          bbox_wgs84,
-        "bbox_buffered_itm":   bbox_buffered_itm,
-        "centre_wgs84":        [centroid.x, centroid.y],
-        "area_m2":             polygon_itm.area,
-        "confidence":          confidence,
+        "name":              course_name,
+        "matched_name":      matched_name,
+        "osm_id":            osm_id,
+        "osm_type":          osm_type,
+        "boundary_wgs84":    mapping(polygon),
+        "bbox_wgs84":        bbox_wgs84,
+        "bbox_buffered_itm": bbox_buffered,
+        "centre_wgs84":      [centroid.x, centroid.y],
+        "area_m2":           area_m2,
+        "confidence":        confidence,
     }
 
 
@@ -264,26 +494,46 @@ def boundary_from_bbox(
 ) -> dict:
     """
     Create boundary data from a manually entered bounding box (WGS84).
-    Use this if OSM boundary resolution fails.
 
-    FIX 3: Automatically refines bbox to 40–200 ha by querying OSM for the
-    actual golf_course polygon, then falling back to fairway cluster sizing.
+    Before accepting the bbox, tries to find the real course polygon by
+    querying Overpass around the bbox centre.  Falls back to the bbox
+    rectangle if that query fails.
     """
     from shapely.geometry import box as shapely_box
     from shapely.ops import transform
-    from pyproj import Transformer
 
-    # FIX 3: Attempt to refine oversized/undersized bbox via OSM
+    ctr_lat = (min_lat + max_lat) / 2.0
+    ctr_lon = (min_lon + max_lon) / 2.0
+
+    # Try to get the real polygon from the bbox centre
+    for radius in (_RADIUS_TIGHT_M, _RADIUS_WIDE_M):
+        try:
+            poly_result = _overpass_polygon_around_point(ctr_lat, ctr_lon, radius)
+            if poly_result:
+                polygon, matched_name, osm_id, osm_type = poly_result
+                log.info(
+                    f"boundary_from_bbox: resolved real polygon for "
+                    f"{matched_name!r} at radius {radius}m"
+                )
+                return _build_boundary_dict(
+                    polygon, course_name, matched_name, osm_id, osm_type,
+                    confidence="MEDIUM",
+                )
+        except Exception as e:
+            log.debug(f"bbox polygon lookup at radius {radius}m failed: {e}")
+
+    # Polygon lookup failed — use refined bbox
+    log.info("boundary_from_bbox: using bbox rectangle (polygon lookup failed)")
     refined = _refine_bbox(min_lon, min_lat, max_lon, max_lat, course_name)
     min_lon, min_lat, max_lon, max_lat = refined
 
-    polygon = shapely_box(min_lon, min_lat, max_lon, max_lat)
+    polygon  = shapely_box(min_lon, min_lat, max_lon, max_lat)
     centroid = polygon.centroid
 
-    transformer_to_itm = Transformer.from_crs(config.CRS_WGS84, config.CRS_ITM, always_xy=True)
-    polygon_itm = transform(transformer_to_itm.transform, polygon)
-    itm_bounds = polygon_itm.bounds
-    buf = config.BOUNDARY_BUFFER_M
+    t_to_itm    = Transformer.from_crs(config.CRS_WGS84, config.CRS_ITM, always_xy=True)
+    polygon_itm = transform(t_to_itm.transform, polygon)
+    itm_bounds  = polygon_itm.bounds
+    buf         = config.BOUNDARY_BUFFER_M
 
     return {
         "name":                course_name,
@@ -302,90 +552,136 @@ def boundary_from_bbox(
     }
 
 
-# ─── FIX 3: Bbox refinement ───────────────────────────────────────────────────
+# ─── Overpass query templates ─────────────────────────────────────────────────
+
+def _overpass_query_by_name(name: str) -> str:
+    escaped = name.replace('"', '\\"')
+    return f"""
+[out:json][timeout:{config.OVERPASS_TIMEOUT}];
+(
+  way["leisure"="golf_course"]["name"~"{escaped}",i];
+  relation["leisure"="golf_course"]["name"~"{escaped}",i];
+  way["landuse"="golf_course"]["name"~"{escaped}",i];
+  relation["landuse"="golf_course"]["name"~"{escaped}",i];
+);
+out body;
+>;
+out skel qt;
+"""
+
+
+def _overpass_query_relation_full(relation_id: int) -> str:
+    return f"""
+[out:json][timeout:{config.OVERPASS_TIMEOUT}];
+relation({relation_id});
+out body;
+>;
+out skel qt;
+"""
+
+
+def _overpass_query_way_full(way_id: int) -> str:
+    return f"""
+[out:json][timeout:{config.OVERPASS_TIMEOUT}];
+way({way_id});
+out body;
+>;
+out skel qt;
+"""
+
+
+# ─── Geometry reconstruction ─────────────────────────────────────────────────
+
+def _reconstruct_nodes(elements: list) -> dict:
+    return {
+        el["id"]: (el["lon"], el["lat"])
+        for el in elements
+        if el["type"] == "node"
+    }
+
+
+def _reconstruct_way_coords(way_nodes: list, node_map: dict) -> list:
+    return [node_map[nid] for nid in way_nodes if nid in node_map]
+
+
+def _coords_to_polygon(coords: list):
+    """Convert a coordinate list to a Shapely Polygon, or None."""
+    from shapely.geometry import Polygon
+    if len(coords) < 4:
+        return None
+    try:
+        poly = Polygon(coords)
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        return poly if not poly.is_empty else None
+    except Exception:
+        return None
+
+
+def _ways_to_polygon(elements: list):
+    """Reconstruct boundary polygon from Overpass way elements."""
+    from shapely.geometry import Polygon, LinearRing
+    from shapely.ops import polygonize
+
+    node_map = _reconstruct_nodes(elements)
+    rings = []
+
+    for el in elements:
+        if el["type"] != "way":
+            continue
+        coords = _reconstruct_way_coords(el.get("nodes", []), node_map)
+        if len(coords) >= 4:
+            rings.append(coords)
+
+    if not rings:
+        return None
+
+    if len(rings) == 1:
+        return _coords_to_polygon(rings[0])
+
+    from shapely.geometry import LineString
+    lines = [LineString(r) for r in rings]
+    polys = list(polygonize(lines))
+    if polys:
+        return unary_union(polys)
+    return None
+
+
+# ─── FIX 3: Bbox refinement (kept for boundary_from_bbox fallback) ────────────
 
 def _refine_bbox(
     min_lon: float, min_lat: float, max_lon: float, max_lat: float,
     course_name: str,
 ) -> tuple:
     """
-    FIX 3: Refine bounding box to stay within 40–200 ha.
-
-    Algorithm:
-      1. Query OSM for golf_course polygon within the initial bbox
-      2. If found → use polygon bounds (tightest, most accurate)
-      3. Otherwise → query fairway cluster and expand 120%
-      4. Clamp result to [40 ha, 200 ha] around centroid
-
-    Returns:
-        (min_lon, min_lat, max_lon, max_lat) refined WGS84 tuple
+    Refine bounding box to stay within 40–200 ha.
+    Uses OSM polygon or fairway cluster sizing.
     """
     from shapely.geometry import box as shapely_box
-    from shapely.ops import transform, unary_union
-    from pyproj import Transformer
+    from shapely.ops import transform
 
     t_to_itm = Transformer.from_crs("EPSG:4326", "EPSG:2157", always_xy=True)
-
-    # Measure initial area
-    init_poly_itm = transform(
+    init_area = transform(
         t_to_itm.transform,
         shapely_box(min_lon, min_lat, max_lon, max_lat)
-    )
-    init_area = init_poly_itm.area
+    ).area
     center_lon = (min_lon + max_lon) / 2
     center_lat = (min_lat + max_lat) / 2
 
-    log.debug(f"Initial bbox area: {init_area/10000:.1f} ha")
-
-    # Step 1: Try OSM golf_course polygon within bbox
-    try:
-        osm_poly = _query_golf_course_polygon(min_lon, min_lat, max_lon, max_lat)
-        if osm_poly is not None:
-            bounds = osm_poly.bounds
-            poly_itm = transform(t_to_itm.transform, osm_poly)
-            area = poly_itm.area
-            if _BBOX_AREA_MIN_M2 <= area <= _BBOX_AREA_MAX_M2:
-                log.info(f"FIX 3: Using OSM golf_course polygon ({area/10000:.1f} ha)")
-                return bounds  # (min_lon, min_lat, max_lon, max_lat)
-            elif area < _BBOX_AREA_MIN_M2:
-                log.debug(f"OSM polygon too small ({area/10000:.1f} ha), expanding")
-                return _clamp_bbox_around_centroid(
-                    bounds[0], bounds[1], bounds[2], bounds[3],
-                    center_lon, center_lat, t_to_itm
-                )
-            else:
-                log.debug(f"OSM polygon too large ({area/10000:.1f} ha), clamping")
-                return _clamp_bbox_around_centroid(
-                    bounds[0], bounds[1], bounds[2], bounds[3],
-                    center_lon, center_lat, t_to_itm
-                )
-    except Exception as e:
-        log.debug(f"FIX 3: OSM golf_course query failed: {e}")
-
-    # Step 2: If initial bbox is already in range, keep it
+    # If already in range, keep
     if _BBOX_AREA_MIN_M2 <= init_area <= _BBOX_AREA_MAX_M2:
-        log.debug("FIX 3: Initial bbox already in range, keeping")
         return (min_lon, min_lat, max_lon, max_lat)
 
-    # Step 3: Try fairway cluster sizing
+    # Try fairway cluster sizing
     try:
         fairway_bbox = _query_fairway_cluster_bbox(min_lon, min_lat, max_lon, max_lat)
         if fairway_bbox is not None:
-            fw_min_lon, fw_min_lat, fw_max_lon, fw_max_lat = fairway_bbox
-            # Expand 120%
-            fw_poly = shapely_box(fw_min_lon, fw_min_lat, fw_max_lon, fw_max_lat)
-            fw_itm = transform(t_to_itm.transform, fw_poly)
-            cx_itm, cy_itm = fw_itm.centroid.x, fw_itm.centroid.y
-            hw = math.sqrt(fw_itm.area * 1.2) / 2
-            log.info(f"FIX 3: Using 120% fairway cluster bbox ({fw_itm.area*1.2/10000:.1f} ha est.)")
             return _clamp_bbox_around_centroid(
-                fw_min_lon, fw_min_lat, fw_max_lon, fw_max_lat,
-                center_lon, center_lat, t_to_itm
+                *fairway_bbox, center_lon, center_lat, t_to_itm
             )
     except Exception as e:
-        log.debug(f"FIX 3: Fairway cluster query failed: {e}")
+        log.debug(f"Fairway cluster query failed: {e}")
 
-    # Step 4: Clamp oversized initial bbox around centroid
     return _clamp_bbox_around_centroid(
         min_lon, min_lat, max_lon, max_lat,
         center_lon, center_lat, t_to_itm
@@ -396,9 +692,6 @@ def _clamp_bbox_around_centroid(
     min_lon, min_lat, max_lon, max_lat,
     center_lon, center_lat, t_to_itm
 ) -> tuple:
-    """
-    Clamp bbox to [40–200 ha] centered on centroid, preserving aspect ratio.
-    """
     from shapely.geometry import box as shapely_box
     from shapely.ops import transform
 
@@ -415,14 +708,9 @@ def _clamp_bbox_around_centroid(
     else:
         return (min_lon, min_lat, max_lon, max_lat)
 
-    # Scale factor to achieve target area
-    scale = math.sqrt(target_area / max(area, 1.0))
-    half_lon = (max_lon - min_lon) / 2 * scale
-    half_lat = (max_lat - min_lat) / 2 * scale
-
-    # Maintain a minimum half-span of ~500m (~0.005°)
-    half_lon = max(half_lon, 0.005)
-    half_lat = max(half_lat, 0.004)
+    scale    = math.sqrt(target_area / max(area, 1.0))
+    half_lon = max((max_lon - min_lon) / 2 * scale, 0.005)
+    half_lat = max((max_lat - min_lat) / 2 * scale, 0.004)
 
     new_min_lon = center_lon - half_lon
     new_max_lon = center_lon + half_lon
@@ -438,10 +726,7 @@ def _clamp_bbox_around_centroid(
 
 
 def _query_golf_course_polygon(min_lon, min_lat, max_lon, max_lat):
-    """
-    Query Overpass for a golf_course polygon within the bbox.
-    Returns largest Shapely polygon found, or None.
-    """
+    """Query Overpass for a golf_course polygon within the bbox."""
     from shapely.geometry import MultiPolygon
 
     query = f"""
@@ -454,7 +739,7 @@ out body;
 >;
 out skel qt;
 """
-    resp = _overpass_request(query, retries=2)
+    resp     = _overpass_request(query, retries=2)
     elements = resp.get("elements", [])
     if not elements:
         return None
@@ -468,13 +753,7 @@ out skel qt;
 
 
 def _query_fairway_cluster_bbox(min_lon, min_lat, max_lon, max_lat):
-    """
-    Query Overpass for fairway polygons within bbox.
-    Returns bounding box of all fairways as (min_lon, min_lat, max_lon, max_lat), or None.
-    """
-    from shapely.geometry import box as shapely_box
-    from shapely.ops import unary_union
-
+    """Query Overpass for fairway polygons; return their bounding box."""
     query = f"""
 [out:json][timeout:30];
 (
@@ -485,7 +764,7 @@ out body;
 >;
 out skel qt;
 """
-    resp = _overpass_request(query, retries=2)
+    resp     = _overpass_request(query, retries=2)
     elements = resp.get("elements", [])
     if not elements:
         return None
@@ -508,12 +787,10 @@ out skel qt;
     if not polygons:
         return None
 
-    merged = unary_union(polygons)
-    bounds = merged.bounds  # (min_lon, min_lat, max_lon, max_lat)
-    return bounds
+    return unary_union(polygons).bounds
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# ─── Network ──────────────────────────────────────────────────────────────────
 
 def _overpass_request(query: str, retries: int = 3) -> dict:
     """Send an Overpass QL query and return parsed JSON."""
@@ -529,50 +806,45 @@ def _overpass_request(query: str, retries: int = 3) -> dict:
         except requests.RequestException as e:
             if attempt < retries - 1:
                 wait = 2 ** attempt
-                log.warning(f"Overpass request failed (attempt {attempt+1}): {e}. Retrying in {wait}s...")
+                log.warning(
+                    f"Overpass request failed (attempt {attempt+1}): {e}. "
+                    f"Retrying in {wait}s..."
+                )
                 time.sleep(wait)
             else:
-                raise RuntimeError(f"Overpass API unavailable after {retries} attempts: {e}") from e
+                raise RuntimeError(
+                    f"Overpass API unavailable after {retries} attempts: {e}"
+                ) from e
     return {}
 
 
+# ─── String helpers ───────────────────────────────────────────────────────────
+
 def _name_similarity(a: str, b: str) -> float:
-    """Simple token overlap similarity."""
     if not a or not b:
         return 0.0
-    tokens_a = set(a.split())
-    tokens_b = set(b.split())
-    # Strip common suffixes
-    stop = {"golf", "club", "course", "links", "gc", "the"}
-    tokens_a -= stop
-    tokens_b -= stop
+    stop     = {"golf", "club", "course", "links", "gc", "the"}
+    tokens_a = set(a.split()) - stop
+    tokens_b = set(b.split()) - stop
     if not tokens_a or not tokens_b:
         return 0.5
-    intersection = tokens_a & tokens_b
-    return len(intersection) / max(len(tokens_a), len(tokens_b))
+    return len(tokens_a & tokens_b) / max(len(tokens_a), len(tokens_b))
 
 
 def _build_name_variants(course_name: str) -> list:
-    """
-    Build a list of progressively shorter name variants to try against OSM.
-
-    Example: "Old Conna Golf Club" →
-      ["Old Conna Golf Club", "Old Conna Golf", "Old Conna", "Conna"]
-    """
     variants = [course_name]
-    suffixes_to_strip = [
+    suffixes = [
         " Golf Club", " Golf Links", " Golf Course", " Golf & Country Club",
         " Golf", " Club", " Links", " Course",
     ]
     working = course_name
-    for suffix in suffixes_to_strip:
+    for suffix in suffixes:
         if working.lower().endswith(suffix.lower()):
             working = working[: len(working) - len(suffix)].strip()
             if working and working not in variants:
                 variants.append(working)
 
-    # Also try just the first significant word (for very specific searches)
-    stop = {"golf", "club", "course", "links", "the", "old", "new", "royal"}
+    stop  = {"golf", "club", "course", "links", "the", "old", "new", "royal"}
     words = [w for w in working.split() if w.lower() not in stop]
     if words and len(words[-1]) > 3:
         last_word = words[-1]
@@ -582,22 +854,26 @@ def _build_name_variants(course_name: str) -> list:
     return variants
 
 
+def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371000.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi       = phi2 - phi1
+    dlam       = math.radians(lon2 - lon1)
+    a = (math.sin(dphi / 2) ** 2
+         + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2)
+    return 2 * R * math.asin(math.sqrt(min(a, 1.0)))
+
+
 def _raise_not_found(course_name: str) -> None:
-    """Raise a helpful ValueError when no OSM match is found."""
-    # Check if a nearby known course might help orient the user
-    known_hint = ""
     key = course_name.strip().lower()
-    # Suggest adding to KNOWN_COURSES
-    known_hint = (
-        f"\n\nIf this course is not in OpenStreetMap, add it to KNOWN_COURSES in config.py:\n"
-        f'  "{key}": [min_lon, min_lat, max_lon, max_lat],\n'
-        f"Or use --bbox directly:\n"
-        f"  python scripts/run_pipeline.py \"{course_name}\" "
-        f"--bbox min_lon,min_lat,max_lon,max_lat\n"
-        f"(Find coordinates at openstreetmap.org — right-click → 'Show address')"
-    )
     raise ValueError(
-        f"No OSM golf course found for: {course_name!r}\n"
-        f"Tried name variants but found nothing in OpenStreetMap."
-        + known_hint
+        f"No golf course found for: {course_name!r}\n"
+        f"Nominatim geocode and all Overpass queries returned no results.\n\n"
+        f"Options:\n"
+        f"  1. Add to KNOWN_COURSES in config.py:\n"
+        f'     "{key}": [min_lon, min_lat, max_lon, max_lat],\n'
+        f"  2. Use --bbox on the command line:\n"
+        f"     python scripts/run_pipeline.py \"{course_name}\" "
+        f"--bbox min_lon,min_lat,max_lon,max_lat\n"
+        f"     (Find coordinates at openstreetmap.org — right-click → 'Show address')"
     )

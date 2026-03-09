@@ -413,6 +413,25 @@ Examples:
             log.info(f"  Feature validation: {_val_results}")
         except Exception as ve:
             log.debug(f"Feature validation failed (non-critical): {ve}")
+
+        # Boundary fitness check: verify the boundary covers the right course
+        try:
+            from pipeline.boundary import verify_boundary_fit
+            _det_counts = {
+                k: v.get("count", 0)
+                for k, v in vision_summary.get("detections", {}).items()
+            }
+            _bfit_ok, _bfit_reason = verify_boundary_fit(boundary_data, _det_counts)
+            if _bfit_ok:
+                log.info(f"  Boundary verification: {_bfit_reason}")
+            else:
+                log.warning(f"  Boundary verification FAILED: {_bfit_reason}")
+                log.warning(
+                    "  TIP: If the wrong course is being reconstructed, delete "
+                    "boundary.json and re-run (Nominatim will re-geocode)."
+                )
+        except Exception as bve:
+            log.debug(f"Boundary verification failed (non-critical): {bve}")
     except Exception as e:
         log.warning(f"  Vision extraction failed (non-critical): {e}")
 

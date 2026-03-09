@@ -4,8 +4,15 @@ All tunable parameters live here. Edit this file before running the pipeline.
 """
 
 # ─── Overpass API ────────────────────────────────────────────────────────────
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+OVERPASS_URL     = "https://overpass-api.de/api/interpreter"
 OVERPASS_TIMEOUT = 120  # seconds
+
+# ─── Nominatim geocoder ───────────────────────────────────────────────────────
+# Nominatim is used as the primary geocoder in boundary.py to resolve course
+# names to precise (lat, lon) before the Overpass polygon lookup.
+# The public instance has a 1 req/s rate limit; always include a User-Agent.
+NOMINATIM_URL     = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_TIMEOUT = 12   # seconds
 
 # ─── LiDAR sources ────────────────────────────────────────────────────────────
 # Irish National LiDAR Programme (Tailte Éireann) STAC endpoint
