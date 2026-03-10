@@ -235,9 +235,13 @@ YARDAGE_BOOK_ENABLED = True
 YARDAGE_BOOK_MIN_CONFIDENCE = 0.35
 
 # ─── OCR ─────────────────────────────────────────────────────────────────────
-# Path to tesseract executable. Empty = auto-detect.
-# Windows example: r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-TESSERACT_CMD = ""
+# Path to tesseract executable.
+#   Windows : r"C:\Program Files\Tesseract-OCR\tesseract.exe"  (set below)
+#   Linux   : "" → auto-detect via PATH (tesseract installed via apt/brew)
+#   macOS   : "" → auto-detect (installed via `brew install tesseract`)
+# If TESSERACT_CMD is set and the binary does not exist at that path, the
+# pipeline will log a warning and skip OCR rather than crash.
+TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 # ─── Routing diagram ─────────────────────────────────────────────────────────
 ROUTING_DIAGRAM_ENABLED = True

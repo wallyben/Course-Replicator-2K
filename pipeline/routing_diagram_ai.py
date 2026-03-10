@@ -179,6 +179,13 @@ _GREEN_MAX_AREA_FRAC    = 0.05   # greens can't cover > 5 % of diagram
 
 _TEE_ASPECT_MIN = 1.1            # tees are elongated rectangles
 _TEE_ASPECT_MAX = 9.0
+_TEE_NMS_PX     = 30             # non-maximum suppression radius for tee centroids
+
+# Named aliases matching _AREA_MIN_PX — used by detectors for clarity
+_FAIRWAY_MIN_AREA = _AREA_MIN_PX["fairway"]   # 800 px²
+_GREEN_MIN_AREA   = _AREA_MIN_PX["green"]     # 150 px²
+_BUNKER_MIN_AREA  = _AREA_MIN_PX["bunker"]    #  40 px²
+_WATER_MIN_AREA   = _AREA_MIN_PX["water"]     # 300 px²
 
 # Contour polygon simplification (fraction of arc length)
 _SIMPLIFY_EPS_FRAC = 0.005
@@ -321,17 +328,40 @@ class RoutingDiagramExtractor:
 
         # Step 1 — colour masks + Step 2 — morphological cleanup
         log.info("  Step 1-2:  HSV segmentation + morphological cleanup")
-        fairways = self._detect_layer("fairway")
-        greens   = self._detect_layer("green")
-        bunkers  = self._detect_layer("bunker")
-        water    = self._detect_layer("water")
+        try:
+            fairways = self._detect_layer("fairway")
+        except Exception as _e:
+            log.warning("  fairway detection failed (%s) — continuing with empty list", _e)
+            fairways = []
+        try:
+            greens = self._detect_layer("green")
+        except Exception as _e:
+            log.warning("  green detection failed (%s) — continuing with empty list", _e)
+            greens = []
+        try:
+            bunkers = self._detect_layer("bunker")
+        except Exception as _e:
+            log.warning("  bunker detection failed (%s) — continuing with empty list", _e)
+            bunkers = []
+        try:
+            water = self._detect_layer("water")
+        except Exception as _e:
+            log.warning("  water detection failed (%s) — continuing with empty list", _e)
+            water = []
 
         # Resolve fairway/green ambiguity: re-classify overlapping regions
-        fairways, greens = self._resolve_fairway_green_overlap(fairways, greens)
+        try:
+            fairways, greens = self._resolve_fairway_green_overlap(fairways, greens)
+        except Exception as _e:
+            log.warning("  fairway/green overlap resolution failed (%s) — skipped", _e)
 
         # Step 4 — tee detection
         log.info("  Step 4:    Tee detection (approxPolyDP rectangularity)")
-        tees = self._detect_tees()
+        try:
+            tees = self._detect_tees()
+        except Exception as _e:
+            log.warning("  tee detection failed (%s) — continuing with empty list", _e)
+            tees = []
 
         log.info(
             f"  Counts  — fairways:{len(fairways)}  greens:{len(greens)}  "
@@ -340,17 +370,29 @@ class RoutingDiagramExtractor:
 
         # Step 5 — OCR
         log.info("  Step 5:    OCR — hole number detection")
-        hole_positions = self._detect_hole_numbers()
+        try:
+            hole_positions = self._detect_hole_numbers()
+        except Exception as _e:
+            log.warning("  OCR stage failed (%s) — hole numbers unavailable", _e)
+            hole_positions = []
         log.info(f"  OCR found  {len(hole_positions)} hole number(s)")
 
         # Hole association + routing
         log.info("  Step 5-6:  Associating holes + building routing")
-        hole_map = self._associate_holes(hole_positions, tees, greens, fairways)
-        holes    = self._construct_routing(hole_map, tees, greens, fairways)
+        try:
+            hole_map = self._associate_holes(hole_positions, tees, greens, fairways)
+            holes    = self._construct_routing(hole_map, tees, greens, fairways)
+        except Exception as _e:
+            log.warning("  hole routing failed (%s) — no routing data", _e)
+            hole_map = {}
+            holes    = []
         log.info(f"  Routing:   {len(holes)} hole route(s)")
 
         # Stamp hole_number onto matched features
-        self._stamp_hole_numbers(hole_map, tees, greens, fairways)
+        try:
+            self._stamp_hole_numbers(hole_map, tees, greens, fairways)
+        except Exception as _e:
+            log.warning("  hole number stamping failed (%s) — skipped", _e)
 
         result = {
             "fairways": fairways,
@@ -363,7 +405,10 @@ class RoutingDiagramExtractor:
 
         # Step 7 — debug overlay
         log.info("  Step 7:    Writing debug overlay")
-        self._write_debug_overlay(result)
+        try:
+            self._write_debug_overlay(result)
+        except Exception as _e:
+            log.warning("  debug overlay failed (%s) — skipped", _e)
 
         return result
 
